@@ -1,0 +1,68 @@
+name: Build Flutter APK
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Scaffold Android + patch compileSdk
+        run: |
+          if [ ! -d "android" ]; then
+            PROJECT_NAME=$(grep '^name:' pubspec.yaml | awk '{print $2}')
+            flutter create . --project-name "$PROJECT_NAME" --platforms=android
+          fi
+
+          GRADLE_FILE="android/build.gradle"
+          if [ -f "$GRADLE_FILE" ]; then
+            if ! grep -q "compileSdkVersion 36" "$GRADLE_FILE"; then
+              printf '\n\nsubprojects {\n    afterEvaluate { project ->\n        if (project.plugins.hasPlugin("com.android.application") || project.plugins.hasPlugin("com.android.library")) {\n            project.android {\n                compileSdkVersion 36\n            }\n        }\n    }\n}\n' >> "$GRADLE_FILE"
+            fi
+            echo "--- build.gradle tail ---"
+            tail -15 "$GRADLE_FILE"
+          fi
+
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if ! grep -q "android.permission.NFC" "$MANIFEST"; then
+            sed -i 's|<application|<uses-permission android:name="android.permission.NFC"/>\n    <uses-feature android:name="android.hardware.nfc" android:required="false"/>\n    <application|' "$MANIFEST"
+          fi
+          sed -i 's|android:name="${applicationName}"||' "$MANIFEST"
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Test
+        run: flutter test || true
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v5
+        with:
+          name: app-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
