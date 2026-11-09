@@ -427,6 +427,36 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 if (session == 0L || session == sessionId) teardown()
                 result.success(null)
             }
+
+            // PATCH 5: a phone-only diagnostic. Everything the analyser relies on,
+// in one map, so a bug on a device with no adb can still be read off
+// the screen.
+"debugState" -> {
+    result.success(
+        mapOf(
+            "nativeReady" to nativeReady,
+            "modelsLoaded" to modelsLoaded,
+            "scannerHandle" to scannerHandle,
+            "busy" to busy,
+            "scanning" to scanning,
+            "analyzedFrames" to analyzedFrames,
+            "skippedFrames" to skippedFrames,
+            "previewW" to previewW,
+            "previewH" to previewH,
+            "bufW" to bufW,
+            "bufH" to bufH,
+            "shortSide" to shortSide,
+            "starting" to starting,
+            "sessionId" to sessionId,
+            "boundShortSide" to boundShortSide,
+            "hasProvider" to (cameraProvider != null),
+            "hasCamera" to (camera != null),
+            "hasAnalysis" to (analysis != null),
+            "hasPreview" to (preview != null),
+            "lastNv21" to (lastNv21?.size ?: 0),
+        )
+    )
+}
             else -> result.notImplemented()
         }
     }
