@@ -13,6 +13,7 @@ import android.util.Size
 import android.content.res.Configuration
 import android.view.OrientationEventListener
 import android.view.Surface
+import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
@@ -20,7 +21,6 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceRequest
-import androidx.camera.core.AspectRatio
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
@@ -55,40 +55,41 @@ import java.util.concurrent.Executors
  *
  * **Bind strategy — one AspectRatioStrategy, two ResolutionSelectors.**
  *
- * Both use cases share a single [AspectRatioStrategy] instance (16:9, with
- * auto fallback). The *instance* is shared, not merely the value: CameraX
- * uses object identity in its stream-combination negotiation, and two
- * distinct AspectRatioStrategy objects that happen to describe the same
- * ratio can be treated as two different constraints, which is what put this
- * device into the zero-sized-ImageProxy state in earlier attempts. Sharing
- * the instance is what the Google CameraX documentation recommends for the
- * Preview + ImageAnalysis pair, and it is what makes the analyser attach to
- * the session correctly here.
+ * Both use cases share a single [AspectRatioStrategy] *instance* (not merely
+ * the same value): CameraX uses object identity in stream-combination
+ * negotiation, and two distinct objects describing the same ratio can be
+ * treated as two different constraints, which is what put this Huawei into a
+ * zero-sized-ImageProxy state in earlier attempts. Same target size for both,
+ * with [ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER] — a bigger
+ * frame is decodable, a smaller one loses detail.
  *
- * Both use cases request the same target size, with
- * [ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER]: if the exact
- * size is not available, take the next size up rather than down — a bigger
- * frame is decodable, a smaller one loses detail the scanner needs.
+ * **Huawei wake-up bug.**
  *
- * **SCAN_ENABLED.** Frames are passed to NativeScanner.scanFrame. The gate
- * still exists so a future diagnostic can turn the scanner off without
- * touching anything else; right now it is on.
+ * On STG-LX2 / P Smart 5G (EMUI 12, Android 12), ImageAnalysis attaches to
+ * the session but the HAL never begins streaming YUV to it — every frame is
+ * either a zero-sized ImageProxy or nothing arrives at all. Manual zoom to a
+ * visible value (1.5x, 2x) fixes it: the HAL begins streaming once a
+ * sustained control change reaches the running CaptureRequest.
+ *
+ * [startWakeUpLoop] reproduces that: a zoom to 1.1x, held for 300 ms, repeated
+ * every 1.2 s until the first frame arrives or eight attempts have been made.
+ * Torch and AF triggers were tried and are gone — torch flashes visibly on
+ * this device (the LED does not blink fast enough to be invisible), and AF
+ * does not wake the stream.
+ *
+ * **SCAN_ENABLED.** Frames are passed to NativeScanner.scanFrame.
  *
  * **Downscale.** If the analyser receives something much bigger than the
- * requested size (a HAL that ignores the resolution selector and hands back
- * 4096x2160), the Y plane is downscaled before Rust sees it — Rust and the
- * TFLite models were built for 1280x720 through 3840x2160, not for
- * 4096x2160, and the raw MAXIMUM buffer crashes the scanner. At the sizes
- * the selector actually asks for, no downscale happens: the frame goes to
- * Rust as it arrived.
+ * requested size (a HAL that ignores the selector and hands back 4096x2160),
+ * the Y plane is downscaled before Rust sees it. At the sizes the selector
+ * actually asks for, no downscale happens.
  *
- * **Buffer caching.** Three buffers ([yBuf], [nv21Buf], [downscaleBuf]) are
- * reused across frames. Allocating fresh ByteArrays per frame at full
- * resolution is ~680 MB/s of garbage, which no GC keeps up with.
+ * **Buffer caching.** [yBuf], [nv21Buf], [downscaleBuf] are reused across
+ * frames. Per-frame allocation at full resolution is ~680 MB/s of garbage.
  *
  * **try-catch.** Every callback and public method is wrapped in
- * try-catch(Throwable). It does not catch a Rust panic that aborts via
- * SIGABRT — that is not a Java exception.
+ * try-catch(Throwable), which catches Kotlin/Java exceptions and Errors
+ * (including OutOfMemoryError) but not a Rust SIGABRT.
  */
 class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     EventChannel.StreamHandler, ActivityAware, LifecycleOwner {
@@ -108,7 +109,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         private const val ROTATION_CHECK_DELAY_MS = 120L
         private const val SETTLE_CHECKS = 3
-        private const val KICK_COOLDOWN_MS = 1000L
 
         /** When true, frames reach NativeScanner.scanFrame. */
         private const val SCAN_ENABLED = true
@@ -119,11 +119,18 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         /**
          * A frame more than this many times the requested pixel count is
          * considered "HAL gave us something much bigger than asked" and is
-         * downscaled before Rust. A factor of 2 means 1280x720 (921K px)
-         * tolerates up to ~1.8M px without resize, and 1920x1080 (2.07M px)
-         * up to ~4.1M px. 4096x2160 is 8.8M and gets downscaled.
+         * downscaled before Rust.
          */
         private const val DOWNSCALE_THRESHOLD = 2
+
+        /** Zoom kick: how much of a change, in ratio, held for how long. */
+        private const val KICK_ZOOM_FACTOR = 1.1f
+        private const val KICK_ZOOM_HOLD_MS = 300L
+
+        /** Wake-up loop: interval between attempts, and how many total. */
+        private const val WAKE_UP_INTERVAL_MS = 1200L
+        private const val WAKE_UP_MAX_ATTEMPTS = 8
+        private const val WAKE_UP_FIRST_DELAY_MS = 800L
     }
 
     @Volatile private var scannerHandle: Long = 0L
@@ -196,10 +203,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var emptyFrames = 0L
     @Volatile private var firstNScans = 0
 
-    @Volatile private var lastKickAt = 0L
-    @Volatile private var kickStrategy = 0
+    // Wake-up loop state.
+    private var wakeUpRunnable: Runnable? = null
+    private var wakeUpAttempts = 0
     @Volatile private var kickCount = 0
 
+    // Diagnostic: last measured Y-plane stats.
     @Volatile private var diagW = 0
     @Volatile private var diagH = 0
     @Volatile private var diagStride = 0
@@ -345,7 +354,9 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     )
                 }
                 "kickStream" -> {
-                    main.post { try { kickAnalysisStream(force = true) } catch (_: Throwable) {} }
+                    main.post {
+                        try { kickWithZoom(manual = true) } catch (_: Throwable) {}
+                    }
                     result.success(null)
                 }
                 "debugState" -> {
@@ -372,9 +383,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "hasAnalysis" to (analysis != null),
                             "hasPreview" to (preview != null),
                             "lastNv21" to (lastNv21?.size ?: 0),
-                            "lastKickAt" to lastKickAt,
-                            "kickStrategy" to kickStrategy,
                             "kickCount" to kickCount,
+                            "wakeUpAttempts" to wakeUpAttempts,
                             "scanEnabled" to SCAN_ENABLED,
                             "desiredSize" to
                                 "${targetSize(shortSide).width}x${targetSize(shortSide).height}",
@@ -608,10 +618,9 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     /**
      * Binds Preview and ImageAnalysis with a *shared* AspectRatioStrategy
-     * instance and identical ResolutionStrategies. This is the Google-
-     * recommended shape for a Preview + ImageAnalysis pair, and the shared
-     * instance is what stops CameraX from treating the two use cases as two
-     * different constraints and falling back to a zero-sized stream.
+     * instance and identical ResolutionStrategies. See the class comment on
+     * why the shared instance matters. After bind, [startWakeUpLoop] begins
+     * firing the zoom kick until a frame arrives or it gives up.
      */
     private fun bindUseCases(st: SurfaceTexture) {
         val provider = cameraProvider ?: return
@@ -621,16 +630,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         val selector = CameraSelector.DEFAULT_BACK_CAMERA
         val desiredSize = targetSize(shortSide)
 
-        // One AspectRatioStrategy, shared by both builders. Object identity
-        // matters to CameraX's SurfaceCombination negotiation.
+        // One AspectRatioStrategy, shared by both builders.
         val aspectRatioStrategy = AspectRatioStrategy(
             AspectRatio.RATIO_16_9,
             AspectRatioStrategy.FALLBACK_RULE_AUTO,
         )
 
-        // Both use cases ask for the same size, and prefer a higher fallback
-        // if the exact one is not available — a bigger frame still decodes,
-        // a smaller one loses the detail the scanner needs.
         val previewResolutionSelector = ResolutionSelector.Builder()
             .setAspectRatioStrategy(aspectRatioStrategy)
             .setResolutionStrategy(
@@ -709,47 +714,108 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         recomputePreviewSize()
 
         emptyFrames = 0
-        kickStrategy = 0
-        lastKickAt = 0
         diagFramesSeen = 0
+        wakeUpAttempts = 0
+        kickCount = 0
 
-        main.postDelayed({ try { kickAnalysisStream(force = false) } catch (_: Throwable) {} }, 400L)
-        main.postDelayed({ try { kickAnalysisStream(force = false) } catch (_: Throwable) {} }, 1400L)
+        // Start the wake-up loop. It fires the zoom kick every 1.2 s until
+        // a frame arrives, because a single blip is often too early or too
+        // small: 1.02x for 120 ms gets coalesced away by the HAL, whereas a
+        // sustained change to 1.1x held for 300 ms matches what manual zoom
+        // does — and manual zoom is what works on this device.
+        startWakeUpLoop()
 
         focusAt(0.5, 0.5)
     }
 
-    private fun kickAnalysisStream(force: Boolean = false) {
-        try {
-            val cam = camera ?: return
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (!force && now - lastKickAt < KICK_COOLDOWN_MS) return
-            lastKickAt = now
-            kickCount++
+    // ---------- wake-up loop ----------
 
-            val strategy = if (force) 0 else kickStrategy % 3
-            if (!force) kickStrategy++
-
-            when (strategy) {
-                0 -> {
-                    val current = cam.cameraInfo.zoomState.value?.zoomRatio ?: 1.0f
-                    if (!force && current > 1.1f) return
-                    val base = if (current > 0.99f) 1.0f else current
-                    cam.cameraControl.setZoomRatio(base * 1.02f)
-                    main.postDelayed({
-                        try { cam.cameraControl.setZoomRatio(base) } catch (_: Throwable) {}
-                    }, 120L)
+    private fun startWakeUpLoop() {
+        stopWakeUpLoop()
+        wakeUpAttempts = 0
+        val r = object : Runnable {
+            override fun run() {
+                try {
+                    if (!scanning || wakeUpIsDone()) {
+                        stopWakeUpLoop()
+                        return
+                    }
+                    if (wakeUpAttempts >= WAKE_UP_MAX_ATTEMPTS) {
+                        android.util.Log.w(
+                            TAG,
+                            "wake-up gave up after $wakeUpAttempts attempts; " +
+                            "diagFramesSeen=$diagFramesSeen emptyFrames=$emptyFrames",
+                        )
+                        stopWakeUpLoop()
+                        return
+                    }
+                    wakeUpAttempts++
+                    kickWithZoom(manual = false)
+                    main.postDelayed(this, WAKE_UP_INTERVAL_MS)
+                } catch (e: Throwable) {
+                    android.util.Log.w(TAG, "wake-up loop failed: ${e.message}")
+                    stopWakeUpLoop()
                 }
-                1 -> {
-                    cam.cameraControl.enableTorch(true)
-                    main.postDelayed({
-                        try { cam.cameraControl.enableTorch(false) } catch (_: Throwable) {}
-                    }, 25L)
-                }
-                2 -> focusAt(0.5, 0.5)
             }
+        }
+        wakeUpRunnable = r
+        main.postDelayed(r, WAKE_UP_FIRST_DELAY_MS)
+    }
+
+    private fun stopWakeUpLoop() {
+        wakeUpRunnable?.let { main.removeCallbacks(it) }
+        wakeUpRunnable = null
+    }
+
+    private fun wakeUpIsDone(): Boolean =
+        diagFramesSeen > 0 || analyzedFrames > 0
+
+    /**
+     * A sustained zoom change to a visibly different value, held long
+     * enough for the HAL to process at least one frame at that zoom, then
+     * a return to the original ratio.
+     *
+     * This is the shape manual testing found working: not a quick blip
+     * (which the HAL can coalesce away), but a change the camera actually
+     * spends time at. 1.1x for 300 ms is the smallest version that still
+     * registers as a sustained change.
+     */
+    private fun kickWithZoom(manual: Boolean) {
+        val cam = camera ?: return
+        try {
+            val current = cam.cameraInfo.zoomState.value?.zoomRatio ?: 1.0f
+            if (!manual && current > 1.05f) {
+                android.util.Log.i(
+                    TAG,
+                    "zoom kick #$wakeUpAttempts skipped: user at " +
+                    "${String.format(Locale.US, "%.2f", current)}x",
+                )
+                return
+            }
+            val original = current.coerceAtLeast(1.0f)
+            val maxZoom = cam.cameraInfo.zoomState.value?.maxZoomRatio ?: 4.0f
+            val nudged = (original * KICK_ZOOM_FACTOR).coerceAtMost(maxZoom)
+            if (nudged <= original + 0.01f) {
+                android.util.Log.i(
+                    TAG,
+                    "zoom kick #$wakeUpAttempts: no headroom (max=$maxZoom)",
+                )
+                return
+            }
+            kickCount++
+            cam.cameraControl.setZoomRatio(nudged)
+            android.util.Log.i(
+                TAG,
+                "zoom kick #$wakeUpAttempts: " +
+                "${String.format(Locale.US, "%.2f", original)}x -> " +
+                "${String.format(Locale.US, "%.2f", nudged)}x " +
+                "(hold ${KICK_ZOOM_HOLD_MS}ms)",
+            )
+            main.postDelayed({
+                try { cam.cameraControl.setZoomRatio(original) } catch (_: Throwable) {}
+            }, KICK_ZOOM_HOLD_MS)
         } catch (e: Throwable) {
-            android.util.Log.w(TAG, "kick failed: ${e.message}")
+            android.util.Log.w(TAG, "zoom kick failed: ${e.message}")
         }
     }
 
@@ -1048,6 +1114,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     }
 
     // ---------- per frame ----------
+
     private fun analyze(image: ImageProxy) {
         try {
             if (image.width == 0 || image.height == 0) {
@@ -1056,9 +1123,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.w(
                         TAG,
                         "empty #$emptyFrames: ${image.width}x${image.height} " +
-                        "format=${image.format} — kicking",
+                        "format=${image.format}",
                     )
-                    main.post { try { kickAnalysisStream(force = false) } catch (_: Throwable) {} }
                 }
                 try { image.close() } catch (_: Throwable) {}
                 return
@@ -1066,6 +1132,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             if (emptyFrames > 0) {
                 android.util.Log.i(TAG, "stream woke after $emptyFrames empty frames")
                 emptyFrames = 0
+            }
+
+            // First real frame: the wake-up loop is no longer needed.
+            if (diagFramesSeen == 0L) {
+                stopWakeUpLoop()
+                android.util.Log.i(TAG, "first frame arrived — wake-up loop stopped")
             }
 
             val w = image.width
@@ -1100,8 +1172,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
             try { image.close() } catch (_: Throwable) {}
 
-            // Measure every frame, always — the diagnostic panel is the only
-            // way to know what arrived, on a phone with no computer attached.
             val stats = measureYPlane(y, w, h, rowStride)
             diagW = w
             diagH = h
@@ -1146,8 +1216,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             val framePixels = w.toLong() * h
 
             if (framePixels > desiredPixels * DOWNSCALE_THRESHOLD) {
-                // HAL gave something much bigger (e.g. 4096x2160 for a 720p
-                // request). Downscale; the raw buffer crashes Rust.
                 val dstSize = desiredSize.width * desiredSize.height
                 val dst = ensureDownscaleBuffer(dstSize)
                 downscaleGrayInto(
@@ -1166,8 +1234,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     busy = false
                 }
             } else {
-                // Frame is at or near the requested size; pass it through
-                // untouched.
                 analyzedFrames++
                 busy = true
                 try {
@@ -1221,6 +1287,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private fun teardown() {
         try {
+            stopWakeUpLoop()
             starting = false
             orientationListener?.disable()
             orientationListener = null
@@ -1244,8 +1311,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             boundShortSide = 0
             lastNv21 = null
             emptyFrames = 0
-            lastKickAt = 0
-            kickStrategy = 0
+            wakeUpAttempts = 0
             releaseScanner()
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "teardown failed", e)
