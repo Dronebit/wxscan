@@ -709,102 +709,89 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
      * means rebuilding and rebinding. The SurfaceTexture is reused, so the
      * textureId Dart holds does not change and the interface is not rebuilt.
      */
-    private fun bindUseCases(st: SurfaceTexture) {
-        val provider = cameraProvider ?: return
-        provider.unbindAll()
-        boundShortSide = shortSide
+   private fun bindUseCases(st: SurfaceTexture) {
+    val provider = cameraProvider ?: return
+    provider.unbindAll()
+    boundShortSide = shortSide
 
-        val selector = CameraSelector.DEFAULT_BACK_CAMERA
+    val selector = CameraSelector.DEFAULT_BACK_CAMERA
 
-        // The resolution is stated explicitly: setTargetResolution is
-        // deprecated as of CameraX 1.3, and on some devices it picks something
-        // like a 1952x1952 square, three times the work for nothing.
-        val resolution = ResolutionSelector.Builder()
-            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
-            .setResolutionStrategy(
-                ResolutionStrategy(
-                    targetSize(shortSide),
-                    // Prefer the smaller one: doubling the resolution
-                    // multiplies the per-frame cost and does not help
-                    // scanning.
-                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
-                )
-            )
-            .build()
-
-        lastTargetRotation = uiRotation()
-        displayRotationDegrees = rotationDegrees(lastTargetRotation)
-
-        // Preview: CameraX Preview into a Flutter SurfaceTexture, with
-        // targetRotation pinned to ROTATION_0, so the texture is always
-        // upright with respect to the natural orientation.
-        val previewUseCase = Preview.Builder()
-            .setResolutionSelector(resolution)
-            .setTargetRotation(Surface.ROTATION_0)
-            .build()
-        previewUseCase.setSurfaceProvider { request: SurfaceRequest ->
-            val res = request.resolution
-            android.util.Log.i(
-                TAG,
-                "surface request ${res.width}x${res.height} (current buf=${bufW}x$bufH)"
-            )
-            // The buffer keeps the size the camera gives, in sensor
-            // orientation.
-            st.setDefaultBufferSize(res.width, res.height)
-            bufW = res.width
-            bufH = res.height
-            val surface = Surface(st)
-            previewSurface = surface
-            recomputePreviewSize()
-            request.provideSurface(surface, ContextCompat.getMainExecutor(appContext)) {
-                surface.release()
-            }
-        }
-        preview = previewUseCase
-
-        // Analysis: the Y plane of YUV_420_888 is already the grayscale
-        // image, so it goes straight to Rust.
-        //
-        // PATCH 1a: state the output format explicitly. CameraX's default is
-        // YUV_420_888, but on some Huawei HALs the default ends up RGBA_8888
-        // — one plane instead of three — and then `toNv21` throws before the
-        // frame ever reaches the scanner. Asking for YUV by name removes
-        // that ambiguity. Devices that already returned YUV keep doing so.
-        val analysisUseCase = ImageAnalysis.Builder()
-            .setResolutionSelector(resolution)
-            .setTargetRotation(lastTargetRotation)
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-            .build()
-        analysisUseCase.setAnalyzer(camExec, ::analyze)
-        analysis = analysisUseCase
-
-        camera = provider.bindToLifecycle(
-            this, selector, previewUseCase, analysisUseCase
-        )
-        startOrientationListener()
-
-        previewUseCase.resolutionInfo?.resolution?.let {
-            bufW = it.width; bufH = it.height
-        }
-        recomputePreviewSize()
-
-        // One focus scan on open, because binding does not run one.
-        //
-        // CameraX binds with continuous auto-focus, and continuous means
-        // "react to what changes" — a phone already held over a code changes
-        // nothing, so the lens stays where the last session left it, which for
-        // scanning at 10 to 30 cm is usually far too far away. The picture is
-        // then too soft to detect anything in, and every assist an application
-        // might apply waits on a detection: no box, so nothing asks for focus,
-        // so the box never comes.
-        //
-        // AVFoundation is told `autoFocusRangeRestriction = .near` for the same
-        // reason. Camera2 has no equivalent, so it is asked for a scan instead
-        // and left to fall back to continuous by itself.
-        focusAt(0.5, 0.5)
+    // One ResolutionSelector, shared by both use cases. The two streams are
+    // asked for the same size in the same aspect ratio, because some Huawei
+    // HALs cannot negotiate two different configurations at once: when
+    // Preview wants one size and ImageAnalysis wants another, the HAL ends up
+    // handing the analyser a zero-sized ImageProxy while the preview renders
+    // fine on the GPU. Giving both the same request removes that negotiation.
+    //
+    // setTargetResolution (deprecated in CameraX 1.3) rather than
+    // ResolutionSelector's newer path: on the Huawei HALs in question, the
+    // newer negotiation is the one that produces 0x0, and the older call is
+    // the one that does not.
+    val (targetW, targetH) = when (shortSide) {
+        720 -> 1280 to 720
+        1080 -> 1920 to 1080
+        0 -> 3840 to 2160
+        else -> (shortSide * 16 / 9) to shortSide
     }
+    val sharedSize = Size(targetW, targetH)
 
+    lastTargetRotation = uiRotation()
+    displayRotationDegrees = rotationDegrees(lastTargetRotation)
+
+    // Preview: same size, GPU path, 16:9 upright with respect to the device's
+    // natural orientation.
+    val previewUseCase = Preview.Builder()
+        .setTargetResolution(sharedSize)
+        .setTargetRotation(Surface.ROTATION_0)
+        .build()
+    previewUseCase.setSurfaceProvider { request: SurfaceRequest ->
+        val res = request.resolution
+        android.util.Log.i(
+            TAG,
+            "surface request ${res.width}x${res.height} (current buf=${bufW}x$bufH)"
+        )
+        st.setDefaultBufferSize(res.width, res.height)
+        bufW = res.width
+        bufH = res.height
+        val surface = Surface(st)
+        previewSurface = surface
+        recomputePreviewSize()
+        request.provideSurface(surface, ContextCompat.getMainExecutor(appContext)) {
+            surface.release()
+        }
+    }
+    preview = previewUseCase
+
+    // Analysis: same size, same aspect ratio, YUV_420_888 explicitly, and
+    // KEEP_ONLY_LATEST — the default. BLOCK_PRODUCER was tried as a fix for
+    // the 0x0 symptom and did not help; reverting it here so the two paths
+    // differ in nothing but how they read the buffer.
+    val analysisUseCase = ImageAnalysis.Builder()
+        .setTargetResolution(sharedSize)
+        .setTargetRotation(lastTargetRotation)
+        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+        .build()
+    analysisUseCase.setAnalyzer(camExec, ::analyze)
+    analysis = analysisUseCase
+
+    android.util.Log.i(
+        TAG,
+        "binding: preview=$sharedSize analysis=$sharedSize (unified)",
+    )
+
+    camera = provider.bindToLifecycle(
+        this, selector, previewUseCase, analysisUseCase
+    )
+    startOrientationListener()
+
+    previewUseCase.resolutionInfo?.resolution?.let {
+        bufW = it.width; bufH = it.height
+    }
+    recomputePreviewSize()
+
+    focusAt(0.5, 0.5)
+}  
     /** Rebinds the use cases at the current shortSide, to change resolution.
      *  Must be called on the main thread. */
     private fun rebindUseCases() {
