@@ -226,6 +226,14 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     private var statTotalMs = 0L
     private var statMaxMs = 0L
 
+    // PATCH 3: counters for the frame-skip diagnostic.
+    /** Frames handed to the scanner since boot. */
+    @Volatile private var analyzedFrames = 0L
+    /** Frames that got past Y extraction but were then skipped. */
+    @Volatile private var skippedFrames = 0L
+    /** First few scans, logged in full to catch a broken bridge. */
+    @Volatile private var firstNScans = 0
+
     // ---------- FlutterPlugin ----------
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         appContext = binding.applicationContext
@@ -236,7 +244,18 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         eventChannel.setStreamHandler(this)
         sizeChannel = EventChannel(binding.binaryMessenger, "wxscan_live/preview_size")
         sizeChannel.setStreamHandler(sizeHandler)
-        nativeReady = try { NativeScanner.ping() == "wxscan" } catch (_: Throwable) { false }
+        // PATCH 2: say out loud whether the native library loaded. A silent
+        // `false` here leaves the analyser dropping every frame with no
+        // visible trace anywhere in Dart or logcat, which is exactly the
+        // "preview works, nothing decodes" symptom on Huawei.
+        nativeReady = try {
+            val ping = NativeScanner.ping()
+            android.util.Log.i(TAG, "NativeScanner.ping() = '$ping'")
+            ping == "wxscan"
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "NativeScanner.ping FAILED — library not loaded", e)
+            false
+        }
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -463,35 +482,64 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             // A retain that comes back 0 means the handle names no scanner:
             // stale, from an isolate that is gone. Falling through and building
             // one here is better than a camera that decodes nothing.
-            scannerHandle = try { NativeScanner.retain(borrowed) } catch (_: Throwable) { 0L }
+            // PATCH 4: log both branches — retain failing is the second-most
+            // silent way frames disappear.
+            scannerHandle = try {
+                NativeScanner.retain(borrowed)
+            } catch (e: Throwable) {
+                android.util.Log.e(TAG, "scanner retain FAILED borrowed=$borrowed", e)
+                0L
+            }
             if (scannerHandle != 0L) {
                 // Built elsewhere, from weights this side never saw, so the
                 // answer is asked for rather than inferred.
                 modelsLoaded = try {
                     NativeScanner.hasDetector(scannerHandle)
                 } catch (_: Throwable) { false }
+                android.util.Log.i(
+                    TAG,
+                    "scanner borrowed: handle=$scannerHandle modelsLoaded=$modelsLoaded",
+                )
                 return
             }
         }
 
         val empty = ByteArray(0)
         val fromPaths = detectPath != null || srPath != null
+        // PATCH 4: log creation and failure. A silent 0L here leaves
+        // `analyze()` skipping every frame; the log names the path and the
+        // exception that made it 0.
         scannerHandle = try {
-            // Paths and buffers are not mixed: a caller sends one or the other,
-            // and the Dart side refuses anything else before it gets here.
-            if (fromPaths) NativeScanner.createFromPaths(detectPath, srPath)
-            else NativeScanner.create(detect ?: empty, sr ?: empty)
+            val h = if (fromPaths) NativeScanner.createFromPaths(detectPath, srPath)
+                    else NativeScanner.create(detect ?: empty, sr ?: empty)
+            android.util.Log.i(
+                TAG,
+                "scanner created: handle=$h paths=$fromPaths " +
+                "detectPath=$detectPath srPath=$srPath",
+            )
+            h
         } catch (e: Throwable) {
-            // Not fatal, as unloadable weights are not: decoding falls back to
-            // image processing and `modelsLoaded` says so. Logged with the
-            // path, because that is the one thing the caller needs to fix it
-            // and the one thing a boolean cannot carry.
-            android.util.Log.w(TAG, "scanner from paths failed: ${e.message}")
+            android.util.Log.e(
+                TAG,
+                "scanner create FAILED paths=$fromPaths " +
+                "detectPath=$detectPath srPath=$srPath",
+                e,
+            )
             0L
         }
         modelsLoaded = scannerHandle != 0L && (detect != null || detectPath != null)
         if (scannerHandle == 0L) {
-            scannerHandle = try { NativeScanner.create(empty, empty) } catch (_: Throwable) { 0L }
+            // Falls back to plain image processing. Still worth logging,
+            // because a scanner that never had weights is not the same as
+            // one whose weights failed — the second is fixable.
+            scannerHandle = try {
+                val h = NativeScanner.create(empty, empty)
+                android.util.Log.w(TAG, "scanner fallback (no weights): handle=$h")
+                h
+            } catch (e: Throwable) {
+                android.util.Log.e(TAG, "scanner fallback FAILED", e)
+                0L
+            }
         }
     }
 
@@ -686,10 +734,17 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         // Analysis: the Y plane of YUV_420_888 is already the grayscale
         // image, so it goes straight to Rust.
+        //
+        // PATCH 1a: state the output format explicitly. CameraX's default is
+        // YUV_420_888, but on some Huawei HALs the default ends up RGBA_8888
+        // — one plane instead of three — and then `toNv21` throws before the
+        // frame ever reaches the scanner. Asking for YUV by name removes
+        // that ambiguity. Devices that already returned YUV keep doing so.
         val analysisUseCase = ImageAnalysis.Builder()
             .setResolutionSelector(resolution)
             .setTargetRotation(lastTargetRotation)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
         analysisUseCase.setAnalyzer(camExec, ::analyze)
         analysis = analysisUseCase
@@ -991,39 +1046,77 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     }
 
     // ---------- per frame ----------
+    //
+    // PATCH 1b: the Y plane and the NV21 copy are extracted separately. The
+    // scanner only needs Y — a grayscale image — and if the driver hands us
+    // a frame whose planes cannot be turned into NV21 (RGBA on some Huawei
+    // devices: one plane, not three), that failure must not take the frame
+    // down with it. Before this patch, `toNv21` threw inside the same `try`
+    // that extracted Y, the catch closed the image and returned, and the
+    // frame never reached `submitScan` — so the preview worked and nothing
+    // decoded. Now the NV21 copy is optional: if it fails, `grabFrame` will
+    // return null (the picker falls back to a live preview without a frozen
+    // frame, which is a worse UX but a working scanner), and the Y plane is
+    // still handed to Rust.
     private fun analyze(image: ImageProxy) {
         val y: ByteArray
         val w: Int
         val h: Int
         val rowStride: Int
         val rot: Int
+
+        // 1. Y plane — the grayscale image the scanner decodes. Its failure
+        // is a real one; nothing can be scanned without it.
         try {
-            val plane = image.planes[0]          // the Y plane is the grayscale image
+            val plane = image.planes[0]
             rowStride = plane.rowStride
             w = image.width
             h = image.height
             rot = image.imageInfo.rotationDegrees
             y = ByteArray(plane.buffer.remaining())
             plane.buffer.get(y)
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "grab Y err: ${e.message}", e)
+            image.close()
+            return
+        }
 
-            // Keep a colour copy while we are here: with several codes in
-            // view the picture is frozen for the user to choose from, and
-            // freezing this same frame is what makes the markers line up with
-            // it for free.
-            if (scanning) {
+        // 2. NV21 — only for grabFrame (freezing the picture when several
+        // codes are in view). Its failure must not stop scanning: on Huawei
+        // with an RGBA output the planes are not three, and toNv21 throws.
+        if (scanning) {
+            try {
                 lastNv21 = toNv21(image)
                 lastNv21W = w
                 lastNv21H = h
                 lastNv21Rot = rot
+            } catch (e: Throwable) {
+                android.util.Log.w(
+                    TAG,
+                    "nv21 err (grabFrame disabled): ${e.message} " +
+                    "format=${image.format} planes=${image.planes.size}",
+                )
+                lastNv21 = null
             }
-        } catch (e: Throwable) {
-            android.util.Log.e(TAG, "grab err: ${e.message}")
-            image.close()
-            return
         }
+
         image.close()   // released at once, without waiting for the scan
 
-        if (!scanning || !nativeReady || scannerHandle == 0L || busy) return
+        // PATCH 3: say why a frame was skipped, once every ~60 frames, so a
+        // stalled analyser is visible without a full frame log.
+        if (!scanning || !nativeReady || scannerHandle == 0L || busy) {
+            if (skippedFrames++ % 60 == 0L) {
+                android.util.Log.i(
+                    TAG,
+                    "frame skipped: scanning=$scanning " +
+                    "nativeReady=$nativeReady " +
+                    "scannerHandle=$scannerHandle busy=$busy " +
+                    "format=${image.format} size=${w}x$h",
+                )
+            }
+            return
+        }
+        analyzedFrames++
         busy = true
         // A frame that got past the guard just as the engine went away would
         // otherwise hand work to an executor that has been shut down, and the
@@ -1046,6 +1139,19 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 // are not flipped.
                 val json = NativeScanner.scanFrame(scannerHandle, y, w, h, rowStride, rot, false)
                 val dt = android.os.SystemClock.elapsedRealtime() - t0
+
+                // PATCH 4: log the first few scans in full. If Rust is
+                // reached at all, this line says what it made of the frame
+                // — an empty document means the bridge is fine and the
+                // models or the picture are what failed, not the plugin.
+                if (firstNScans < 5) {
+                    firstNScans++
+                    android.util.Log.i(
+                        TAG,
+                        "scan #$firstNScans: ${w}x$h rot=$rot stride=$rowStride " +
+                        "yLen=${y.size} dt=${dt}ms json='${json.take(120)}'",
+                    )
+                }
 
                 statFrames++
                 statTotalMs += dt
