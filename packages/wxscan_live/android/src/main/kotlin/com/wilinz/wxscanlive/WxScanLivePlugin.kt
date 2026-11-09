@@ -48,38 +48,32 @@ import java.util.concurrent.Executors
  * goes through ImageAnalysis, whose Y plane reaches Rust over JNI without
  * passing through Dart.
  *
- * **Huawei 0x0 bug — Variant A (MAXIMUM YUV).**
+ * **Huawei 0x0 bug — Variant A + downscale.**
  *
  * On some Huawei EMUI builds (STG-LX2 / P Smart 5G, Android 12, EMUI 12,
  * confirmed on the device this was written against) the analysis stream
  * receives zero-sized ImageProxy objects forever, at every preview-aligned
  * resolution (720p, 1080p, 4K), every output format and every backpressure
- * strategy. Preview renders fine, the camera is otherwise healthy, and the
- * device's capabilities include LEVEL_3 with YUV_REPROCESSING — so the HAL
- * can produce YUV in principle.
- *
- * The reason is the LEVEL_3 guaranteed-configuration table:
+ * strategy. Preview renders fine, the device's capabilities include LEVEL_3
+ * with YUV_REPROCESSING, and its guaranteed-configuration table says:
  *
  *     PRIV PREVIEW | PRIV 640x480 | YUV MAXIMUM | RAW MAXIMUM
  *
  * For a combination with Preview, the only guaranteed YUV size is MAXIMUM
- * (the largest YUV size the camera supports, 4096x2160 on this device).
- * Anything smaller — 1280x720, 1920x1080, 1440x1080, 960x720 — is *outside*
- * the guarantee. Most HALs are lenient and hand back the smaller YUV frame
- * anyway; this Huawei is not, and answers with a zero-sized buffer rather
- * than refusing the session. So the analyser asks for MAXIMUM YUV by name:
- * it is bigger and slower, but it is the one size the specification says
- * must work, and on this device it does.
+ * (4096x2160 on this device). Smaller YUV requests are outside the
+ * guarantee, and this HAL answers them with a zero-sized buffer rather than
+ * refusing the session.
  *
- * The preview keeps its own 16:9 request, which is what the UI was laid out
- * for. The two sizes need not match: CameraX negotiates them independently,
- * and the scan path never sees the preview's pixels.
+ * So the analyser asks for [ANALYSIS_MAX_SIZE] — MAXIMUM, by name. Frames
+ * arrive. But Rust and the TFLite models were written for 1280x720 through
+ * 3840x2160, not for 4096x2160: a raw 8.8 MB Y-plane at MAXIMUM crashes the
+ * native scanner (a dimension check, an allocation, or the model's input
+ * validation — the abort is immediate). The two facts have to be reconciled.
  *
- * [kickAnalysisStream] is retained as a secondary path. On devices where
- * even the guaranteed MAXIMUM is not delivered (rare — observed on a
- * different Huawei model, not this one), sending a harmless control request
- * wakes the stream up, because the HAL does not begin streaming to the
- * analysis Surface until some CaptureRequest parameter changes.
+ * So: HAL requests MAXIMUM, frames arrive at MAXIMUM, and before each frame
+ * reaches Rust the Y-plane is downscaled to whatever [shortSide] maps to —
+ * the size Rust was built for. The scanner sees 720p, 1080p or 3840x2160,
+ * exactly as it did before this change; only the HAL request changed.
  */
 class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     EventChannel.StreamHandler, ActivityAware, LifecycleOwner {
@@ -87,32 +81,29 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     companion object {
         private const val TAG = "wxscan_live"
 
-        /** Default preview resolution, in sensor orientation, so landscape. */
         private const val ANALYSIS_WIDTH = 1280
         private const val ANALYSIS_HEIGHT = 720
 
         /**
-         * The YUV size the analyser asks for, regardless of [shortSide].
+         * The YUV size the analyser asks the HAL for, regardless of what
+         * [shortSide] says.
          *
          * LEVEL_3 guarantees exactly one YUV size in combination with
          * Preview, and that size is MAXIMUM. On the STG-LX2, MAXIMUM is
          * 4096x2160 (the largest entry in its YUV_420_888 output-size list),
          * and this is the only value the analyser receives non-zero frames
          * for. Asking for anything smaller returns a zero-sized ImageProxy
-         * with no error — the HAL accepts the session and then never fills
-         * the buffer.
+         * with no error.
          *
-         * If a future device reports a different MAXIMUM, replace this
-         * constant with that device's value. The lookup is not done at
-         * runtime because the value is device-specific and the fallback
-         * (CameraX picks the closest supported size) is the buggy path we
-         * are trying to avoid.
+         * The frame that arrives is downscaled by [downscaleGray] before it
+         * reaches Rust: the scanner is built for 1280x720 through
+         * 3840x2160, not for 4096x2160, and passing the raw MAXIMUM buffer
+         * crashes it.
          */
         private val ANALYSIS_MAX_SIZE = Size(4096, 2160)
 
-        /** Short-side pixels to a target size, in landscape. 0 means the
-         *  highest step, asked for here as 4K; CameraX falls back on its own
-         *  if that is not available. */
+        /** Short-side pixels to a target size, in landscape. This is what
+         *  the scanner receives, and the size the preview is laid out for. */
         private fun targetSize(shortSide: Int): Size = when (shortSide) {
             720 -> Size(1280, 720)
             1080 -> Size(1920, 1080)
@@ -122,9 +113,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         private const val ROTATION_CHECK_DELAY_MS = 120L
         private const val SETTLE_CHECKS = 3
-
-        /** Milliseconds between kicks, so a storm of empty frames does not
-         *  turn into a storm of control requests. */
         private const val KICK_COOLDOWN_MS = 1000L
     }
 
@@ -183,18 +171,15 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var scanning = true
     @Volatile private var nativeReady = false
 
-    // Timing stats: one line every 30 frames.
     private var statFrames = 0
     private var statTotalMs = 0L
     private var statMaxMs = 0L
 
-    // Diagnostic counters, surfaced through debugState.
     @Volatile private var analyzedFrames = 0L
     @Volatile private var skippedFrames = 0L
     @Volatile private var emptyFrames = 0L
     @Volatile private var firstNScans = 0
 
-    // Kick bookkeeping.
     @Volatile private var lastKickAt = 0L
     @Volatile private var kickStrategy = 0
     @Volatile private var kickCount = 0
@@ -354,6 +339,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         "kickStrategy" to kickStrategy,
                         "kickCount" to kickCount,
                         "analysisMaxSize" to "${ANALYSIS_MAX_SIZE.width}x${ANALYSIS_MAX_SIZE.height}",
+                        "scanTargetSize" to
+                            "${targetSize(shortSide).width}x${targetSize(shortSide).height}",
                     )
                 )
             }
@@ -545,20 +532,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
     }
 
-    /**
-     * Builds and binds the preview and analysis use cases.
-     *
-     * Preview keeps the resolution the Dart side asked for (720p / 1080p /
-     * MAXIMUM in 16:9), because the picture is what the user sees and the
-     * scanner UI is laid out for it.
-     *
-     * Analysis asks for [ANALYSIS_MAX_SIZE] regardless of what [shortSide]
-     * says. See the class comment: the LEVEL_3 guaranteed combination for
-     * Preview + YUV is PRIV PREVIEW | YUV MAXIMUM, and this Huawei HAL
-     * enforces that literally, returning a zero-sized ImageProxy for every
-     * smaller YUV request. The analyser is bigger and slower than it would
-     * be at 720p, but it is the one request that works.
-     */
     private fun bindUseCases(st: SurfaceTexture) {
         val provider = cameraProvider ?: return
         provider.unbindAll()
@@ -566,12 +539,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         val selector = CameraSelector.DEFAULT_BACK_CAMERA
 
-        // Preview size: what the UI asked for. Standard 16:9 sizes.
         val previewTargetSize = targetSize(shortSide)
-
-        // Analysis size: MAXIMUM YUV, by specification. Do not compute this
-        // from shortSide; the whole point of Variant A is to ask for the one
-        // size that is guaranteed to be delivered.
         val analysisTargetSize = ANALYSIS_MAX_SIZE
 
         lastTargetRotation = uiRotation()
@@ -610,8 +578,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         android.util.Log.i(
             TAG,
-            "binding (Variant A): preview=$previewTargetSize " +
-            "analysis=$analysisTargetSize (MAXIMUM YUV)",
+            "binding (Variant A + downscale): preview=$previewTargetSize " +
+            "analysis=$analysisTargetSize -> scanned at $previewTargetSize",
         )
 
         camera = provider.bindToLifecycle(
@@ -624,34 +592,16 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
         recomputePreviewSize()
 
-        // Reset per-session kick state.
         emptyFrames = 0
         kickStrategy = 0
         lastKickAt = 0
 
-        // The MAXIMUM-YUV request is the primary fix; these kicks are a
-        // secondary safety net for a HAL that even the guarantee does not
-        // wake up. Harmless if the stream is already awake.
         main.postDelayed({ kickAnalysisStream(force = false) }, 400L)
         main.postDelayed({ kickAnalysisStream(force = false) }, 1400L)
 
         focusAt(0.5, 0.5)
     }
 
-    /**
-     * Sends one harmless control request to wake the analysis stream.
-     *
-     * Three strategies, cycled by [kickStrategy] so a device that ignores
-     * one is tried on the others. Zoom is first: it is the same thing a
-     * user pinch does (which is how this bug was first noticed on a
-     * different Huawei model), it does not flash a light, and it does not
-     * disturb focus. Torch second: brief and silent. AF trigger third:
-     * cheapest of all, but on devices where the lens is already settled it
-     * may not register as a change.
-     *
-     * Rate-limited by [KICK_COOLDOWN_MS]. `force = true` bypasses both the
-     * cooldown and the zoom-in-progress guard.
-     */
     private fun kickAnalysisStream(force: Boolean = false) {
         val cam = camera ?: return
         val now = android.os.SystemClock.elapsedRealtime()
@@ -829,6 +779,54 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         override fun onCancel(arguments: Any?) { sink = null }
     }
 
+    /**
+     * Downscales a Y plane to the size Rust expects.
+     *
+     * The HAL delivers ANALYSIS_MAX_SIZE (4096x2160 on this device), because
+     * that is the one YUV size LEVEL_3 guarantees alongside Preview. But the
+     * scanner — Rust and the TFLite models — was written for the sizes in
+     * [targetSize], and a raw 4096x2160 Y-plane (8.8 MB, plus internal
+     * copies) crashes it: a dimension check, an allocation, or the model's
+     * input validation aborts the process outright. So each frame is
+     * downscaled here, on the camera's own thread, before it reaches Rust.
+     *
+     * Nearest-neighbour sampling. The source is 2 to 3 times larger than the
+     * destination and the destination is what the scanner was built for;
+     * averaging would cost CPU for detail a QR code does not reward. QR
+     * modules are high-contrast edges, and sampling preserves those — what
+     * is lost is the sub-pixel detail the scanner's own detector then
+     * resizes away anyway.
+     *
+     * Row padding is honoured on the source side ([srcStride] may be larger
+     * than [srcW]) and not introduced on the destination side: the returned
+     * buffer is tightly packed, so the caller passes `rowStride = dstW`.
+     */
+    private fun downscaleGray(
+        src: ByteArray,
+        srcW: Int,
+        srcH: Int,
+        srcStride: Int,
+        dstW: Int,
+        dstH: Int,
+    ): ByteArray {
+        // Fast path: same size, no padding. Hand the buffer back untouched.
+        if (srcW == dstW && srcH == dstH && srcStride == srcW) return src
+
+        val dst = ByteArray(dstW * dstH)
+        val xRatio = srcW.toFloat() / dstW
+        val yRatio = srcH.toFloat() / dstH
+        var di = 0
+        for (dy in 0 until dstH) {
+            val sy = (dy * yRatio).toInt().coerceAtMost(srcH - 1)
+            val srcRow = sy * srcStride
+            for (dx in 0 until dstW) {
+                val sx = (dx * xRatio).toInt().coerceAtMost(srcW - 1)
+                dst[di++] = src[srcRow + sx]
+            }
+        }
+        return dst
+    }
+
     /// ImageProxy (YUV_420_888) to NV21.
     private fun toNv21(image: ImageProxy): ByteArray {
         val w = image.width
@@ -885,10 +883,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     // ---------- per frame ----------
     //
-    // The Y plane and the NV21 copy are extracted separately. Zero-sized
-    // ImageProxy objects are the wake-up bug described in the class comment,
-    // not a picture with nothing in it. They are counted, they schedule a
-    // kick, and they never reach Rust.
+    // Y plane and NV21 copy extracted separately: the scanner only needs Y.
+    // Zero-sized ImageProxy objects are the wake-up bug (counted, kicked,
+    // never sent to Rust). Real frames arrive at ANALYSIS_MAX_SIZE and are
+    // downscaled to [targetSize] before the call into Rust.
     private fun analyze(image: ImageProxy) {
         if (image.width == 0 || image.height == 0) {
             emptyFrames++
@@ -958,10 +956,20 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             }
             return
         }
+
+        // Downscale to the size Rust was built for. The HAL delivered
+        // ANALYSIS_MAX_SIZE (guaranteed by LEVEL_3); the scanner is built
+        // for targetSize(shortSide). Doing the conversion here means Rust
+        // never sees 4096x2160 and never aborts on it.
+        val scanTarget = targetSize(shortSide)
+        val yForRust = downscaleGray(
+            y, w, h, rowStride, scanTarget.width, scanTarget.height,
+        )
+
         analyzedFrames++
         busy = true
         try {
-            submitScan(y, w, h, rowStride, rot)
+            submitScan(yForRust, scanTarget.width, scanTarget.height, scanTarget.width, rot)
         } catch (_: java.util.concurrent.RejectedExecutionException) {
             busy = false
         }
