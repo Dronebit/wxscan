@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer' as developer;
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -115,6 +116,26 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   double _zoomRate = 0;
   DateTime _zoomSteppedAt = DateTime.fromMillisecondsSinceEpoch(0);
 
+  // ---------------------------------------------------------------------
+  // Diagnostics. These are what make a stalled camera visible without a
+  // computer: the frame count and the last frame's contents are shown on
+  // the screen in debug builds, and the watchdog turns seven seconds of
+  // silence into a message instead of an empty viewfinder.
+  // ---------------------------------------------------------------------
+
+  /// Fires seven seconds after boot if no frame has arrived. Without this,
+  /// a camera that never delivers frames looks exactly like a camera that
+  /// is pointed at a blank wall.
+  Timer? _watchdogTimer;
+
+  /// Frames received from the analyser since boot. The one number that says
+  /// whether the camera is delivering anything at all.
+  int _rawFrameCount = 0;
+
+  /// A one-line summary of the last frame, shown on screen in debug builds:
+  /// `frame #N: WxH r=.. c=..` or `frame #N: 0x0 (driver bug)`.
+  String _lastFrameInfo = 'waiting for first frame';
+
   @override
   void initState() {
     super.initState();
@@ -123,6 +144,23 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   }
 
   Future<void> _boot() async {
+    _log('boot: start');
+
+    // A retry reuses this state, so anything the previous boot left behind
+    // has to go first: the watchdog, the frame count, a previous controller.
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+    _rawFrameCount = 0;
+    _lastFrameInfo = 'waiting for first frame';
+    _sub?.cancel();
+    _sub = null;
+    final previous = _controller;
+    if (previous != null) {
+      previous.removeListener(_onControllerChanged);
+      previous.dispose();
+      _controller = null;
+    }
+
     try {
       _nnEnabled = await Scanner.init();
       if (kDebugMode) {
@@ -163,6 +201,10 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
         detectModelPath: Scanner.detectModelPath,
         srModelPath: Scanner.srModelPath,
       );
+      _log(
+        'init ok: nativeReady=${controller.value.nativeReady} '
+        'previewSize=${controller.value.previewSize}',
+      );
       if (kDebugMode) {
         unawaited(Scanner.selfTestCameraPath());
       }
@@ -181,7 +223,9 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
       // The preview size lives in the controller and follows rotations by
       // itself; the listener only asks the screen to redraw when it changes.
       controller.addListener(_onControllerChanged);
-      _sub = controller.scans.listen(_onFrame);
+      _sub = controller.scans.listen(_onFrame, onError: (Object e, StackTrace st) {
+        _log('scan stream error: $e');
+      });
       setState(() {
         _controller = controller;
         _hasTorch = hasTorch;
@@ -189,16 +233,91 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
             ? null
             : 'The native scanner failed to load';
       });
+
+      // ---- The critical call ----
+      // Opening the camera brings the pipeline up but does not start sending
+      // frames to the analysis stream; that takes an explicit
+      // setScanning(true). Calling it before the preview is laid out leaves a
+      // black frame on Android, so it waits for the first post-frame
+      // callback. Without this call the viewfinder works and nothing
+      // decodes: the Dart stream of ScanOutcome stays empty forever, and the
+      // only visible symptom is that the user points at a code and nothing
+      // happens.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _controller == null) return;
+        _controller!.setScanning(true);
+        _log('scanning started post-frame');
+      });
+
+      // ---- Watchdog ----
+      // Seven seconds to first frame. If the analyser has delivered nothing
+      // by then, something is wrong that a retry may fix and silence will
+      // not: no frames from the driver, a native scanner handle of zero, an
+      // output format the bridge cannot read, a build with no Rust
+      // libraries. On Huawei this fires when p1080 or an RGBA format means
+      // the camera never produces a YUV frame.
+      _watchdogTimer = Timer(const Duration(seconds: 7), () {
+        if (!mounted || _rawFrameCount > 0) return;
+        _log('watchdog: no frames in 7s');
+        setState(() {
+          _error = 'The camera is not delivering frames.\n'
+              'Try a different resolution in the top bar, or restart the app.';
+        });
+      });
     } on PlatformException catch (e) {
       if (!mounted) return;
+      _log('boot failed: ${e.code}: ${e.message}');
       setState(() => _error = '${e.code}: ${e.message}');
     } catch (e) {
       if (!mounted) return;
+      _log('boot failed: $e');
       setState(() => _error = '$e');
     }
   }
 
   void _onFrame(ScanOutcome frame) {
+    // Every frame gets counted, including the ones that are discarded below:
+    // the count says whether the camera is delivering anything, which is a
+    // different question from whether anything was decoded.
+    _rawFrameCount++;
+
+    // Log the first handful of frames in full. On a phone with no adb this
+    // shows up in `flutter run` if a dev build is running; on a release
+    // build it is cheap and harmless.
+    if (_rawFrameCount <= 5) {
+      _log(
+        'frame #$_rawFrameCount: ${frame.width}x${frame.height} '
+        'results=${frame.results.length} '
+        'candidates=${frame.candidates.length}',
+      );
+    }
+
+    // A frame with pixels has arrived. If the watchdog already showed a
+    // message — because it fired a moment before the driver caught up, or
+    // because a transient stream error was set — clear it. The camera is
+    // working; a stale error would be a lie.
+    if (_rawFrameCount == 1) {
+      _watchdogTimer?.cancel();
+      _watchdogTimer = null;
+      if (_error != null &&
+          _error!.contains('not delivering frames')) {
+        setState(() => _error = null);
+      }
+    }
+
+    // A frame with no pixels is the Huawei driver bug, not a picture with
+    // nothing in it. It carries no image data, so nothing can be decoded
+    // and nothing can be highlighted. Say so in the diagnostic line rather
+    // than treating it as "nothing found".
+    if (frame.width == 0 || frame.height == 0) {
+      _lastFrameInfo = 'frame #$_rawFrameCount: 0x0 (driver)';
+      return;
+    }
+
+    _lastFrameInfo = 'frame #$_rawFrameCount: '
+        '${frame.width}x${frame.height} '
+        'r=${frame.results.length} c=${frame.candidates.length}';
+
     // Do not refresh while picking, or the codes jump about with each new
     // frame and cannot be tapped.
     if (!mounted || _navigating) return;
@@ -691,10 +810,16 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
       // A change of resolution changes the frame size, so the old results'
       // coordinates no longer mean anything.
       _lastFrame = null;
+      // A resolution change rebuilds the use cases; the analyser will start
+      // delivering again only after the new bind is up.
+      _rawFrameCount = 0;
+      _lastFrameInfo = 'changing to ${next.label}...';
     });
     try {
       await _controller!.setResolution(next);
+      _log('resolution changed to ${next.label}');
     } on PlatformException catch (e) {
+      _log('resolution change failed: ${e.code}: ${e.message}');
       if (mounted) setState(() => _error = '${e.code}: ${e.message}');
     }
   }
@@ -775,6 +900,7 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _watchdogTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _sub?.cancel();
     _controller?.removeListener(_onControllerChanged);
@@ -783,6 +909,15 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     _focusTimer?.cancel();
     _zoomDriver?.cancel();
     super.dispose();
+  }
+
+  /// Logs a diagnostic line. The name `wxscan.scan` keeps the scanner's
+  /// own output apart from the plugin's (`wxscan_live`) when reading
+  /// `flutter run` or logcat.
+  void _log(String msg) {
+    developer.log(msg, name: 'wxscan.scan');
+    // ignore: avoid_print
+    print('[wxscan.scan] $msg');
   }
 
   @override
@@ -1065,6 +1200,25 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
                     ? '${_zoom.toStringAsFixed(1)}x - pinch to zoom'
                     : 'Put the QR code in the frame to scan it',
               ),
+              // A diagnostic line under the hint, shown only in debug
+              // builds. It says what the analyser is actually doing — if
+              // this reads "waiting for first frame" while the preview is
+              // live, setScanning(true) never reached the native side; if
+              // it reads "frame #N: 0x0 (driver)" the camera is sending
+              // empty frames, the Huawei bug; if it reads "frame #N:
+              // WxH r=0 c=0" the camera is fine and the detector sees
+              // nothing.
+              if (kDebugMode) ...[
+                const SizedBox(height: 6),
+                Text(
+                  _lastFrameInfo,
+                  style: const TextStyle(
+                    color: Colors.white54,
+                    fontSize: 10,
+                    fontFamily: 'monospace',
+                  ),
+                ),
+              ],
               const SizedBox(height: 20),
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
