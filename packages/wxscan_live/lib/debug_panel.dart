@@ -1,13 +1,11 @@
-/// A phone-only diagnostic panel. Opens from a long-press on the scan
-/// screen, shows everything the native side is willing to say, and can
-/// export the lot to a file for sending on.
+/// A phone-only diagnostic panel. Opens from the scanner's bug button,
+/// shows everything Dart and the native side are willing to say, and can
+/// copy the lot to the clipboard for sending on — no file, no external
+/// dependencies.
 import 'dart:async';
-import 'dart:io';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:wxscan_live/wxscan_live.dart';
 
 const _channel = MethodChannel('wxscan_live');
@@ -37,13 +35,15 @@ class DebugPanel extends StatefulWidget {
 class _DebugPanelState extends State<DebugPanel> {
   Map<String, dynamic> _native = {};
   Timer? _poll;
-  String? _savedPath;
 
   @override
   void initState() {
     super.initState();
     _refresh();
-    _poll = Timer.periodic(const Duration(milliseconds: 800), (_) => _refresh());
+    _poll = Timer.periodic(
+      const Duration(milliseconds: 800),
+      (_) => _refresh(),
+    );
   }
 
   Future<void> _refresh() async {
@@ -57,50 +57,54 @@ class _DebugPanelState extends State<DebugPanel> {
     }
   }
 
-  Future<void> _export() async {
-    final dir = await getApplicationDocumentsDirectory();
-    final stamp = DateTime.now().toIso8601String().replaceAll(':', '-');
-    final file = File('${dir.path}/wxscan_debug_$stamp.txt');
-    final sb = StringBuffer();
-    sb.writeln('=== wxscan debug ===');
-    sb.writeln('generated: ${DateTime.now()}');
-    sb.writeln();
-    sb.writeln('--- native state ---');
+  String _report() {
+    final b = StringBuffer();
+    b.writeln('=== wxscan debug ===');
+    b.writeln('generated: ${DateTime.now()}');
+    b.writeln();
+    b.writeln('--- native state ---');
     for (final e in _native.entries) {
-      sb.writeln('${e.key}: ${e.value}');
+      b.writeln('${e.key}: ${e.value}');
     }
-    sb.writeln();
-    sb.writeln('--- dart counters ---');
-    sb.writeln('frames received: ${widget.framesReceived}');
-    sb.writeln('last frame results: ${widget.lastResults}');
-    sb.writeln('last frame candidates: ${widget.lastCandidates}');
-    sb.writeln('last frame at: ${widget.lastFrameAt}');
+    b.writeln();
+    b.writeln('--- dart counters ---');
+    b.writeln('frames received: ${widget.framesReceived}');
+    b.writeln('last frame results: ${widget.lastResults}');
+    b.writeln('last frame candidates: ${widget.lastCandidates}');
+    b.writeln('last frame at: ${widget.lastFrameAt}');
     if (widget.lastFrameAt != null) {
-      sb.writeln('ms since last frame: '
-          '${DateTime.now().difference(widget.lastFrameAt!).inMilliseconds}');
+      b.writeln(
+        'ms since last frame: '
+        '${DateTime.now().difference(widget.lastFrameAt!).inMilliseconds}',
+      );
     }
-    sb.writeln();
-    sb.writeln('--- controller value ---');
+    b.writeln();
+    b.writeln('--- controller value ---');
     final v = widget.controller?.value;
     if (v != null) {
-      sb.writeln('nativeReady: ${v.nativeReady}');
-      sb.writeln('previewSize: ${v.previewSize}');
+      b.writeln('nativeReady: ${v.nativeReady}');
+      b.writeln('previewSize: ${v.previewSize}');
+      b.writeln('torchEnabled: ${v.torchEnabled}');
+      b.writeln('zoom: ${v.zoom}');
+      b.writeln('resolution: ${v.resolution}');
     } else {
-      sb.writeln('controller is null');
+      b.writeln('controller is null');
     }
-    sb.writeln();
-    sb.writeln('--- log tail ---');
+    b.writeln();
+    b.writeln('--- log tail ---');
     for (final line in widget.log) {
-      sb.writeln(line);
+      b.writeln(line);
     }
-    await file.writeAsString(sb.toString(), flush: true);
-    if (!mounted) return;
-    setState(() => _savedPath = file.path);
-    // Also copy to clipboard so it can be pasted straight into Telegram.
-    await Clipboard.setData(ClipboardData(text: sb.toString()));
+    return b.toString();
+  }
+
+  Future<void> _copy() async {
+    await Clipboard.setData(ClipboardData(text: _report()));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Saved + copied:\n${file.path}')),
+      const SnackBar(
+        content: Text('Copied. Paste into Telegram to send.'),
+      ),
     );
   }
 
@@ -131,12 +135,16 @@ class _DebugPanelState extends State<DebugPanel> {
                   const Expanded(
                     child: Text(
                       'wxscan debug',
-                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                   ),
                   IconButton(
-                    icon: const Icon(Icons.save_alt, color: Colors.white),
-                    onPressed: _export,
+                    icon: const Icon(Icons.copy, color: Colors.white),
+                    onPressed: _copy,
+                    tooltip: 'Copy to clipboard',
                   ),
                   IconButton(
                     icon: const Icon(Icons.close, color: Colors.white),
@@ -150,7 +158,10 @@ class _DebugPanelState extends State<DebugPanel> {
                 padding: const EdgeInsets.all(12),
                 child: DefaultTextStyle(
                   style: const TextStyle(
-                      color: Colors.white, fontFamily: 'monospace', fontSize: 11),
+                    color: Colors.white,
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                  ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -159,6 +170,7 @@ class _DebugPanelState extends State<DebugPanel> {
                         'previewSize': v?.previewSize,
                         'torchEnabled': v?.torchEnabled,
                         'zoom': v?.zoom,
+                        'resolution': v?.resolution,
                       }),
                       _section('DART: stream', {
                         'frames received': widget.framesReceived,
@@ -184,20 +196,12 @@ class _DebugPanelState extends State<DebugPanel> {
                         'analyzedFrames': _native['analyzedFrames'],
                         'skippedFrames': _native['skippedFrames'],
                         'bufW/bufH': '${_native['bufW']}x${_native['bufH']}',
-                        'previewW/H': '${_native['previewW']}x${_native['previewH']}',
+                        'previewW/H':
+                            '${_native['previewW']}x${_native['previewH']}',
                         'shortSide': _native['shortSide'],
                         'boundShortSide': _native['boundShortSide'],
                         'lastNv21 bytes': _native['lastNv21'],
                       }),
-                      if (_savedPath != null)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 12),
-                          child: Text(
-                            'SAVED:\n$_savedPath\n(copied to clipboard)',
-                            style: const TextStyle(
-                                color: Colors.greenAccent, fontSize: 11),
-                          ),
-                        ),
                       const SizedBox(height: 12),
                       _section('DART: last 30 log lines', {
                         for (var i = 0; i < widget.log.length; i++)
@@ -220,12 +224,15 @@ class _DebugPanelState extends State<DebugPanel> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title,
-              style: const TextStyle(
-                  color: Colors.amber,
-                  fontFamily: 'monospace',
-                  fontSize: 12,
-                  fontWeight: FontWeight.w700)),
+          Text(
+            title,
+            style: const TextStyle(
+              color: Colors.amber,
+              fontFamily: 'monospace',
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
           const Divider(color: Colors.white24, height: 8),
           for (final e in values.entries)
             Padding(
