@@ -27,9 +27,6 @@ import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
 import java.io.ByteArrayOutputStream
-import androidx.camera.core.resolutionselector.AspectRatioStrategy
-import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.core.Camera
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
@@ -51,41 +48,38 @@ import java.util.concurrent.Executors
  * goes through ImageAnalysis, whose Y plane reaches Rust over JNI without
  * passing through Dart.
  *
- * Orientation has two traps in it:
- * 1. Flutter's Texture applies the SurfaceTexture transform matrix, which
- *    already carries the sensor rotation. So Dart must *not* wrap the texture
- *    in a RotatedBox; it only has to size the box to the upright dimensions
- *    (see previewSizeStream).
- * 2. The preview's targetRotation is *pinned to ROTATION_0 and never changed*.
- *    CameraX uses it to bring the texture content upright with respect to the
- *    device's *natural* orientation, which is what keeps the size constant.
+ * **Huawei 0x0 bug — Variant A (MAXIMUM YUV).**
  *
- * The scanner itself is the Dart code asset built by the wxscan package,
- * reached through [NativeScanner]. This plugin only handles frames, preview
- * and orientation; a frame goes from CameraX straight into Rust.
+ * On some Huawei EMUI builds (STG-LX2 / P Smart 5G, Android 12, EMUI 12,
+ * confirmed on the device this was written against) the analysis stream
+ * receives zero-sized ImageProxy objects forever, at every preview-aligned
+ * resolution (720p, 1080p, 4K), every output format and every backpressure
+ * strategy. Preview renders fine, the camera is otherwise healthy, and the
+ * device's capabilities include LEVEL_3 with YUV_REPROCESSING — so the HAL
+ * can produce YUV in principle.
  *
- * **The Huawei analysis-stream wake-up bug.**
+ * The reason is the LEVEL_3 guaranteed-configuration table:
  *
- * On some Huawei EMUI builds (STG-LX2 / P Smart 5G, Android 12, EMUI 12 —
- * confirmed on the device this was written against) the CaptureSession is
- * created, the ImageAnalysis Surface is added, and the camera starts
- * rendering Preview fine — but the analysis Surface is never filled. The
- * analyser receives zero-sized ImageProxy objects (`0x0`) forever, at every
- * resolution, format and backpressure strategy.
+ *     PRIV PREVIEW | PRIV 640x480 | YUV MAXIMUM | RAW MAXIMUM
  *
- * The device is not at fault at the HAL contract level: its
- * `YUV_REPROCESSING` capability guarantees `YUV_420_888` through
- * `ImageReader`, and its `LEVEL_3` support means every `OutputConfiguration`
- * works. What is missing is that the HAL does not *begin* streaming to the
- * analysis Surface until some control request reaches the session. Any of
- * `setZoomRatio`, `enableTorch` or an AF trigger will do it — which is why a
- * user who pinches to zoom suddenly sees the scanner start working.
+ * For a combination with Preview, the only guaranteed YUV size is MAXIMUM
+ * (the largest YUV size the camera supports, 4096x2160 on this device).
+ * Anything smaller — 1280x720, 1920x1080, 1440x1080, 960x720 — is *outside*
+ * the guarantee. Most HALs are lenient and hand back the smaller YUV frame
+ * anyway; this Huawei is not, and answers with a zero-sized buffer rather
+ * than refusing the session. So the analyser asks for MAXIMUM YUV by name:
+ * it is bigger and slower, but it is the one size the specification says
+ * must work, and on this device it does.
  *
- * So the fix here is a "kick": after bind, and again whenever empty frames
- * pile up, one harmless control change is sent to wake the stream up. Zoom
- * is the default (it is what the user already does by accident and does not
- * flash a light); torch and AF are fallbacks that cycle if zoom does not
- * suffice. See [kickAnalysisStream].
+ * The preview keeps its own 16:9 request, which is what the UI was laid out
+ * for. The two sizes need not match: CameraX negotiates them independently,
+ * and the scan path never sees the preview's pixels.
+ *
+ * [kickAnalysisStream] is retained as a secondary path. On devices where
+ * even the guaranteed MAXIMUM is not delivered (rare — observed on a
+ * different Huawei model, not this one), sending a harmless control request
+ * wakes the stream up, because the HAL does not begin streaming to the
+ * analysis Surface until some CaptureRequest parameter changes.
  */
 class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     EventChannel.StreamHandler, ActivityAware, LifecycleOwner {
@@ -93,9 +87,28 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     companion object {
         private const val TAG = "wxscan_live"
 
-        /** Default capture resolution, in sensor orientation, so landscape. */
+        /** Default preview resolution, in sensor orientation, so landscape. */
         private const val ANALYSIS_WIDTH = 1280
         private const val ANALYSIS_HEIGHT = 720
+
+        /**
+         * The YUV size the analyser asks for, regardless of [shortSide].
+         *
+         * LEVEL_3 guarantees exactly one YUV size in combination with
+         * Preview, and that size is MAXIMUM. On the STG-LX2, MAXIMUM is
+         * 4096x2160 (the largest entry in its YUV_420_888 output-size list),
+         * and this is the only value the analyser receives non-zero frames
+         * for. Asking for anything smaller returns a zero-sized ImageProxy
+         * with no error — the HAL accepts the session and then never fills
+         * the buffer.
+         *
+         * If a future device reports a different MAXIMUM, replace this
+         * constant with that device's value. The lookup is not done at
+         * runtime because the value is device-specific and the fallback
+         * (CameraX picks the closest supported size) is the buggy path we
+         * are trying to avoid.
+         */
+        private val ANALYSIS_MAX_SIZE = Size(4096, 2160)
 
         /** Short-side pixels to a target size, in landscape. 0 means the
          *  highest step, asked for here as 4K; CameraX falls back on its own
@@ -181,7 +194,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var emptyFrames = 0L
     @Volatile private var firstNScans = 0
 
-    // Kick bookkeeping. See class comment.
+    // Kick bookkeeping.
     @Volatile private var lastKickAt = 0L
     @Volatile private var kickStrategy = 0
     @Volatile private var kickCount = 0
@@ -309,15 +322,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     )
                 )
             }
-            // Manual kick for the diagnostic panel — the Dart side calls
-            // this when the user taps "wake stream" in the panel.
             "kickStream" -> {
                 main.post { kickAnalysisStream(force = true) }
                 result.success(null)
             }
-            // Phone-only diagnostic. Everything the analyser relies on, in
-            // one map, so a bug on a device with no adb is still readable
-            // from the screen.
             "debugState" -> {
                 result.success(
                     mapOf(
@@ -345,6 +353,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         "lastKickAt" to lastKickAt,
                         "kickStrategy" to kickStrategy,
                         "kickCount" to kickCount,
+                        "analysisMaxSize" to "${ANALYSIS_MAX_SIZE.width}x${ANALYSIS_MAX_SIZE.height}",
                     )
                 )
             }
@@ -380,13 +389,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
     }
 
-    /**
-     * Settles which scanner frames are decoded with.
-     *
-     * Dart may hand over the handle of one it already holds. This side takes
-     * its own reference to it either way, so the scanner outlives whichever
-     * side lets go first. Otherwise one is built here.
-     */
     private fun ensureScanner(
         detect: ByteArray?,
         sr: ByteArray?,
@@ -546,17 +548,16 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     /**
      * Builds and binds the preview and analysis use cases.
      *
-     * Both use cases are given the same size and aspect ratio through
-     * setTargetResolution. The modern ResolutionSelector negotiates through a
-     * path that on this device ends up aliasing the analysis stream to a
-     * zero-sized ImageProxy; the older call does not. It is deprecated in
-     * CameraX 1.3, but deprecated still works, and the alternative is a
-     * camera that decodes nothing.
+     * Preview keeps the resolution the Dart side asked for (720p / 1080p /
+     * MAXIMUM in 16:9), because the picture is what the user sees and the
+     * scanner UI is laid out for it.
      *
-     * After bind, [kickAnalysisStream] is scheduled twice — once early
-     * enough to precede the first frames, once late enough to catch a
-     * session that was not yet fully configured the first time. See the
-     * class comment for why this is necessary on Huawei.
+     * Analysis asks for [ANALYSIS_MAX_SIZE] regardless of what [shortSide]
+     * says. See the class comment: the LEVEL_3 guaranteed combination for
+     * Preview + YUV is PRIV PREVIEW | YUV MAXIMUM, and this Huawei HAL
+     * enforces that literally, returning a zero-sized ImageProxy for every
+     * smaller YUV request. The analyser is bigger and slower than it would
+     * be at 720p, but it is the one request that works.
      */
     private fun bindUseCases(st: SurfaceTexture) {
         val provider = cameraProvider ?: return
@@ -565,19 +566,19 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         val selector = CameraSelector.DEFAULT_BACK_CAMERA
 
-        val (targetW, targetH) = when (shortSide) {
-            720 -> 1280 to 720
-            1080 -> 1920 to 1080
-            0 -> 3840 to 2160
-            else -> (shortSide * 16 / 9) to shortSide
-        }
-        val sharedSize = Size(targetW, targetH)
+        // Preview size: what the UI asked for. Standard 16:9 sizes.
+        val previewTargetSize = targetSize(shortSide)
+
+        // Analysis size: MAXIMUM YUV, by specification. Do not compute this
+        // from shortSide; the whole point of Variant A is to ask for the one
+        // size that is guaranteed to be delivered.
+        val analysisTargetSize = ANALYSIS_MAX_SIZE
 
         lastTargetRotation = uiRotation()
         displayRotationDegrees = rotationDegrees(lastTargetRotation)
 
         val previewUseCase = Preview.Builder()
-            .setTargetResolution(sharedSize)
+            .setTargetResolution(previewTargetSize)
             .setTargetRotation(Surface.ROTATION_0)
             .build()
         previewUseCase.setSurfaceProvider { request: SurfaceRequest ->
@@ -599,7 +600,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         preview = previewUseCase
 
         val analysisUseCase = ImageAnalysis.Builder()
-            .setTargetResolution(sharedSize)
+            .setTargetResolution(analysisTargetSize)
             .setTargetRotation(lastTargetRotation)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
@@ -609,7 +610,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         android.util.Log.i(
             TAG,
-            "binding: preview=$sharedSize analysis=$sharedSize (unified)",
+            "binding (Variant A): preview=$previewTargetSize " +
+            "analysis=$analysisTargetSize (MAXIMUM YUV)",
         )
 
         camera = provider.bindToLifecycle(
@@ -627,10 +629,9 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         kickStrategy = 0
         lastKickAt = 0
 
-        // Two kicks: the first shortly after bind (before the first frames
-        // would normally arrive), the second a second later, in case the
-        // session was not fully configured when the first fired. Both are
-        // harmless if the stream is already awake.
+        // The MAXIMUM-YUV request is the primary fix; these kicks are a
+        // secondary safety net for a HAL that even the guarantee does not
+        // wake up. Harmless if the stream is already awake.
         main.postDelayed({ kickAnalysisStream(force = false) }, 400L)
         main.postDelayed({ kickAnalysisStream(force = false) }, 1400L)
 
@@ -642,15 +643,14 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
      *
      * Three strategies, cycled by [kickStrategy] so a device that ignores
      * one is tried on the others. Zoom is first: it is the same thing a
-     * user pinch does (which is how this bug was first noticed), it does
-     * not flash a light, and it does not disturb focus. Torch second:
-     * brief and silent. AF trigger third: cheapest of all, but on devices
-     * where the lens is already settled it may not register as a change.
+     * user pinch does (which is how this bug was first noticed on a
+     * different Huawei model), it does not flash a light, and it does not
+     * disturb focus. Torch second: brief and silent. AF trigger third:
+     * cheapest of all, but on devices where the lens is already settled it
+     * may not register as a change.
      *
-     * Rate-limited by [KICK_COOLDOWN_MS]. `force = true` (used by the
-     * manual "wake stream" button in the diagnostic panel) bypasses both
-     * the cooldown and the zoom-in-progress guard so the user can retry as
-     * often as they like.
+     * Rate-limited by [KICK_COOLDOWN_MS]. `force = true` bypasses both the
+     * cooldown and the zoom-in-progress guard.
      */
     private fun kickAnalysisStream(force: Boolean = false) {
         val cam = camera ?: return
@@ -666,7 +666,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             when (strategy) {
                 0 -> {
                     val current = cam.cameraInfo.zoomState.value?.zoomRatio ?: 1.0f
-                    // Do not fight a user who is mid-pinch.
                     if (!force && current > 1.1f) return
                     val base = if (current > 0.99f) 1.0f else current
                     cam.cameraControl.setZoomRatio(base * 1.02f)
@@ -886,24 +885,13 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     // ---------- per frame ----------
     //
-    // The Y plane and the NV21 copy are extracted separately: the scanner
-    // only needs Y, and if the driver hands us a frame whose planes cannot
-    // be turned into NV21 (RGBA on some Huawei devices: one plane, not
-    // three), that failure must not take the frame down with it.
-    //
-    // Zero-sized ImageProxy objects are the wake-up bug described in the
-    // class comment, not a picture with nothing in it. They are counted,
-    // they schedule a kick, and they never reach Rust — an empty buffer
-    // costs a full scan on the worker thread for a result that could not
-    // exist.
+    // The Y plane and the NV21 copy are extracted separately. Zero-sized
+    // ImageProxy objects are the wake-up bug described in the class comment,
+    // not a picture with nothing in it. They are counted, they schedule a
+    // kick, and they never reach Rust.
     private fun analyze(image: ImageProxy) {
         if (image.width == 0 || image.height == 0) {
             emptyFrames++
-            // Kick at a few points as the empty-frame count climbs: right
-            // away (the stream may simply not have started), once it is
-            // clear the first kick did not help, and once it is clear
-            // nothing has. The cooldown inside kickAnalysisStream stops
-            // this from becoming a storm.
             if (emptyFrames == 5L || emptyFrames == 30L || emptyFrames == 120L) {
                 android.util.Log.w(
                     TAG,
