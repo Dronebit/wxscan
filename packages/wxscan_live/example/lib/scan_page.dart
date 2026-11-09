@@ -119,8 +119,8 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   // ---------------------------------------------------------------------
   // Diagnostics. These are what make a stalled camera visible without a
   // computer: the frame count and the last frame's contents are shown on
-  // the screen in debug builds, and the watchdog turns seven seconds of
-  // silence into a message instead of an empty viewfinder.
+  // the screen, and the watchdog turns seven seconds of silence into a
+  // message instead of an empty viewfinder.
   // ---------------------------------------------------------------------
 
   /// Fires seven seconds after boot if no frame has arrived. Without this,
@@ -132,9 +132,14 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   /// whether the camera is delivering anything at all.
   int _rawFrameCount = 0;
 
-  /// A one-line summary of the last frame, shown on screen in debug builds:
+  /// A one-line summary of the last frame, shown on screen:
   /// `frame #N: WxH r=.. c=..` or `frame #N: 0x0 (driver bug)`.
   String _lastFrameInfo = 'waiting for first frame';
+
+  /// The last few log lines, kept in memory so the debug panel can show them
+  /// on a phone with no computer attached. Bounded so a long session does not
+  /// grow the heap.
+  final List<String> _logBuffer = [];
 
   @override
   void initState() {
@@ -310,13 +315,24 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     // and nothing can be highlighted. Say so in the diagnostic line rather
     // than treating it as "nothing found".
     if (frame.width == 0 || frame.height == 0) {
-      _lastFrameInfo = 'frame #$_rawFrameCount: 0x0 (driver)';
+      if (mounted) {
+        setState(() => _lastFrameInfo =
+            'frame #$_rawFrameCount: 0x0 (driver)');
+      } else {
+        _lastFrameInfo = 'frame #$_rawFrameCount: 0x0 (driver)';
+      }
       return;
     }
 
-    _lastFrameInfo = 'frame #$_rawFrameCount: '
-        '${frame.width}x${frame.height} '
-        'r=${frame.results.length} c=${frame.candidates.length}';
+    if (mounted) {
+      setState(() => _lastFrameInfo = 'frame #$_rawFrameCount: '
+          '${frame.width}x${frame.height} '
+          'r=${frame.results.length} c=${frame.candidates.length}');
+    } else {
+      _lastFrameInfo = 'frame #$_rawFrameCount: '
+          '${frame.width}x${frame.height} '
+          'r=${frame.results.length} c=${frame.candidates.length}';
+    }
 
     // Do not refresh while picking, or the codes jump about with each new
     // frame and cannot be tapped.
@@ -824,6 +840,17 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     }
   }
 
+  /// Opens the diagnostic panel. Always available, because a release build
+  /// is exactly the build that needs it when the scanner silently does
+  /// nothing.
+  Future<void> _openDebugPanel() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => _DebugPanelPage(state: this),
+      ),
+    );
+  }
+
   /// Decoding from the photo library, through the same Rust path the camera
   /// uses.
   Future<void> _pickFromGallery() async {
@@ -913,8 +940,13 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
 
   /// Logs a diagnostic line. The name `wxscan.scan` keeps the scanner's
   /// own output apart from the plugin's (`wxscan_live`) when reading
-  /// `flutter run` or logcat.
+  /// `flutter run` or logcat. The last few lines are also kept in
+  /// [_logBuffer], so the debug panel can show them on a phone with no
+  /// computer attached.
   void _log(String msg) {
+    final stamp = DateTime.now().toIso8601String().substring(11, 23);
+    _logBuffer.add('$stamp $msg');
+    if (_logBuffer.length > 60) _logBuffer.removeAt(0);
     developer.log(msg, name: 'wxscan.scan');
     // ignore: avoid_print
     print('[wxscan.scan] $msg');
@@ -1200,25 +1232,34 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
                     ? '${_zoom.toStringAsFixed(1)}x - pinch to zoom'
                     : 'Put the QR code in the frame to scan it',
               ),
-              // A diagnostic line under the hint, shown only in debug
-              // builds. It says what the analyser is actually doing — if
-              // this reads "waiting for first frame" while the preview is
-              // live, setScanning(true) never reached the native side; if
-              // it reads "frame #N: 0x0 (driver)" the camera is sending
-              // empty frames, the Huawei bug; if it reads "frame #N:
-              // WxH r=0 c=0" the camera is fine and the detector sees
-              // nothing.
-              if (kDebugMode) ...[
-                const SizedBox(height: 6),
-                Text(
+              // Diagnostic line: always visible, release or debug. A red
+              // strip, so it cannot be mistaken for a hint. On a phone with
+              // no computer attached this is the only way to see whether
+              // frames are arriving — `waiting for first frame` means
+              // setScanning(true) never reached the native side or the
+              // driver is silent; `frame #N: 0x0 (driver)` is the Huawei
+              // zero-size bug; `frame #N: WxH r=0 c=0` means frames arrive
+              // and the detector sees nothing; `r=1` means it decoded.
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.red.withValues(alpha: 0.85),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
                   _lastFrameInfo,
                   style: const TextStyle(
-                    color: Colors.white54,
-                    fontSize: 10,
+                    color: Colors.white,
+                    fontSize: 12,
                     fontFamily: 'monospace',
+                    fontWeight: FontWeight.w700,
                   ),
                 ),
-              ],
+              ),
               const SizedBox(height: 20),
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -1242,11 +1283,182 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
                     onPressed: _pickFromGallery,
                     icon: const Icon(Icons.photo_library_outlined),
                   ),
+                  const SizedBox(width: 24),
+                  // Debug panel: opens the Dart-side diagnostic view. Always
+                  // shown, because a release build is exactly the build that
+                  // needs it when a scanner silently does nothing.
+                  IconButton.filledTonal(
+                    onPressed: _openDebugPanel,
+                    icon: const Icon(Icons.bug_report_outlined),
+                  ),
                 ],
               ),
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Diagnostic panel that opens from the scanner's bug button. Shows Dart-
+/// side counters and the last dozen log lines, refreshed every 700 ms.
+/// No native calls — the panel is a pure Dart view, so it works even when
+/// the native layer is dead (which is exactly when it is needed most).
+class _DebugPanelPage extends StatefulWidget {
+  final _ScanPageState state;
+  const _DebugPanelPage({required this.state});
+
+  @override
+  State<_DebugPanelPage> createState() => _DebugPanelPageState();
+}
+
+class _DebugPanelPageState extends State<_DebugPanelPage> {
+  Timer? _poll;
+
+  @override
+  void initState() {
+    super.initState();
+    _poll = Timer.periodic(
+      const Duration(milliseconds: 700),
+      (_) {
+        if (mounted) setState(() {});
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _copy() async {
+    final s = widget.state;
+    final v = s._controller?.value;
+    final b = StringBuffer();
+    b.writeln('=== wxscan debug ===');
+    b.writeln('generated: ${DateTime.now()}');
+    b.writeln();
+    b.writeln('--- dart controller ---');
+    b.writeln('controller: ${s._controller == null ? "null" : "set"}');
+    if (v != null) {
+      b.writeln('nativeReady: ${v.nativeReady}');
+      b.writeln('previewSize: ${v.previewSize}');
+      b.writeln('torchEnabled: ${v.torchEnabled}');
+      b.writeln('zoom: ${v.zoom}');
+      b.writeln('resolution: ${v.resolution}');
+    }
+    b.writeln();
+    b.writeln('--- dart stream ---');
+    b.writeln('rawFrameCount: ${s._rawFrameCount}');
+    b.writeln('lastFrameInfo: ${s._lastFrameInfo}');
+    b.writeln('nnEnabled: ${s._nnEnabled}');
+    b.writeln('weightsProblem: ${Scanner.weightsProblem}');
+    b.writeln();
+    b.writeln('--- current error ---');
+    b.writeln(s._error ?? '(none)');
+    b.writeln();
+    b.writeln('--- last log lines ---');
+    for (final line in s._logBuffer) {
+      b.writeln(line);
+    }
+    await Clipboard.setData(ClipboardData(text: b.toString()));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Copied to clipboard')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = widget.state;
+    final v = s._controller?.value;
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black87,
+        foregroundColor: Colors.white,
+        title: const Text('wxscan debug'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.copy),
+            onPressed: _copy,
+            tooltip: 'Copy all',
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(12),
+          child: DefaultTextStyle(
+            style: const TextStyle(
+              color: Colors.white,
+              fontFamily: 'monospace',
+              fontSize: 12,
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _section('DART: controller', {
+                  'set': s._controller != null,
+                  'nativeReady': v?.nativeReady,
+                  'previewSize': v?.previewSize,
+                  'torchEnabled': v?.torchEnabled,
+                  'zoom': v?.zoom?.toStringAsFixed(2),
+                  'resolution': v?.resolution,
+                }),
+                _section('DART: stream', {
+                  'rawFrameCount': s._rawFrameCount,
+                  'lastFrameInfo': s._lastFrameInfo,
+                  'nnEnabled': s._nnEnabled,
+                  'weightsProblem': Scanner.weightsProblem ?? '(none)',
+                }),
+                _section('DART: error', {
+                  'error': s._error ?? '(none)',
+                }),
+                _section('DART: last 30 log lines', {
+                  for (var i = 0; i < s._logBuffer.length; i++)
+                    '#$i': s._logBuffer[i],
+                }),
+                const SizedBox(height: 20),
+                const Text(
+                  'If rawFrameCount stays 0: frames are not arriving. '
+                  'setScanning(true) never reached the native side, or the '
+                  'driver refuses the resolution. If lastFrameInfo shows '
+                  '0x0: Huawei driver bug. If r=0 c=0: camera fine, detector '
+                  'sees nothing — check weightsProblem above.',
+                  style: TextStyle(color: Colors.white54, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _section(String title, Map<String, Object?> values) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(
+              color: Colors.amber,
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const Divider(color: Colors.white24, height: 8),
+          for (final e in values.entries)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 1),
+              child: Text('${e.key}: ${e.value}'),
+            ),
+        ],
       ),
     );
   }
