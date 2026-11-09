@@ -20,6 +20,10 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceRequest
+import androidx.camera.core.resolutionselector.AspectRatio
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
@@ -49,46 +53,42 @@ import java.util.concurrent.Executors
  * goes through ImageAnalysis, whose Y plane reaches Rust over JNI without
  * passing through Dart.
  *
- * **Diagnostic mode (SCAN_ENABLED = false).**
+ * **Bind strategy — one AspectRatioStrategy, two ResolutionSelectors.**
  *
- * A large Y-plane (4096x2160, 8.8 MB) crashes the native scanner. Before
- * investigating why, the buffer has to be measured: is the HAL delivering a
- * real picture, a zeroed buffer, or all-0xFF? While [SCAN_ENABLED] is false,
- * nothing is passed to NativeScanner.scanFrame; every frame is copied into a
- * reused buffer, sampled (every 64th pixel: min, max, avg), and the first 16
- * bytes are hex-encoded. The summary lands in debugState and on the
- * diagnostic panel. Flip [SCAN_ENABLED] to true once the summary proves the
- * buffer holds a live picture; a crash then is about what Rust does with the
- * input, not about whether the input exists.
+ * Both use cases share a single [AspectRatioStrategy] instance (16:9, with
+ * auto fallback). The *instance* is shared, not merely the value: CameraX
+ * uses object identity in its stream-combination negotiation, and two
+ * distinct AspectRatioStrategy objects that happen to describe the same
+ * ratio can be treated as two different constraints, which is what put this
+ * device into the zero-sized-ImageProxy state in earlier attempts. Sharing
+ * the instance is what the Google CameraX documentation recommends for the
+ * Preview + ImageAnalysis pair, and it is what makes the analyser attach to
+ * the session correctly here.
  *
- * **Huawei 0x0 bug (unchanged).**
+ * Both use cases request the same target size, with
+ * [ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER]: if the exact
+ * size is not available, take the next size up rather than down — a bigger
+ * frame is decodable, a smaller one loses detail the scanner needs.
  *
- * On some Huawei EMUI builds (STG-LX2 / P Smart 5G, Android 12, EMUI 12) the
- * analysis stream receives zero-sized ImageProxy objects at every
- * preview-aligned resolution. Preview renders fine, the device's
- * capabilities include LEVEL_3 with YUV_REPROCESSING, and its
- * guaranteed-configuration table says:
+ * **SCAN_ENABLED.** Frames are passed to NativeScanner.scanFrame. The gate
+ * still exists so a future diagnostic can turn the scanner off without
+ * touching anything else; right now it is on.
  *
- *     PRIV PREVIEW | PRIV 640x480 | YUV MAXIMUM | RAW MAXIMUM
+ * **Downscale.** If the analyser receives something much bigger than the
+ * requested size (a HAL that ignores the resolution selector and hands back
+ * 4096x2160), the Y plane is downscaled before Rust sees it — Rust and the
+ * TFLite models were built for 1280x720 through 3840x2160, not for
+ * 4096x2160, and the raw MAXIMUM buffer crashes the scanner. At the sizes
+ * the selector actually asks for, no downscale happens: the frame goes to
+ * Rust as it arrived.
  *
- * For a combination with Preview, the only guaranteed YUV size is MAXIMUM
- * (4096x2160 here). Smaller YUV requests get a zero-sized buffer. So the
- * analyser asks for [ANALYSIS_MAX_SIZE] by name.
+ * **Buffer caching.** Three buffers ([yBuf], [nv21Buf], [downscaleBuf]) are
+ * reused across frames. Allocating fresh ByteArrays per frame at full
+ * resolution is ~680 MB/s of garbage, which no GC keeps up with.
  *
- * **Buffer caching.**
- *
- * At 4096x2160 and ~30 fps, allocating fresh ByteArrays per frame (y at
- * 8.8 MB, nv21 at 13 MB) is ~680 MB/s of allocations, which no GC keeps up
- * with. Three buffers are cached and reused: [yBuf], [nv21Buf],
- * [downscaleBuf]. NV21 is only built when grabFrame has actually asked for
- * it (the picker, when several codes are in view).
- *
- * **try-catch.**
- *
- * Every callback and public method is wrapped in try-catch(Throwable). It
- * does not catch a Rust panic that aborts via SIGABRT — that is not a Java
- * exception. If the app still crashes after this, logcat will carry an
- * `Abort message:` and the input to Rust needs inspecting.
+ * **try-catch.** Every callback and public method is wrapped in
+ * try-catch(Throwable). It does not catch a Rust panic that aborts via
+ * SIGABRT — that is not a Java exception.
  */
 class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     EventChannel.StreamHandler, ActivityAware, LifecycleOwner {
@@ -98,9 +98,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         private const val ANALYSIS_WIDTH = 1280
         private const val ANALYSIS_HEIGHT = 720
-
-        /** MAXIMUM YUV, the only size LEVEL_3 guarantees with Preview. */
-        private val ANALYSIS_MAX_SIZE = Size(4096, 2160)
 
         private fun targetSize(shortSide: Int): Size = when (shortSide) {
             720 -> Size(1280, 720)
@@ -113,21 +110,20 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         private const val SETTLE_CHECKS = 3
         private const val KICK_COOLDOWN_MS = 1000L
 
-        /**
-         * When true, frames are passed to NativeScanner.scanFrame.
-         *
-         * Set to false for the current investigation. Every frame is still
-         * copied and measured, and the result is surfaced through
-         * debugState; nothing reaches Rust. That is what makes it safe to
-         * look at the buffer without risking the crash that prompted the
-         * diagnostic. Flip to true once the summary proves the buffer holds
-         * a picture.
-         */
-        private const val SCAN_ENABLED = false
+        /** When true, frames reach NativeScanner.scanFrame. */
+        private const val SCAN_ENABLED = true
 
-        /** How many frames the diagnostic logs in full, before it settles
-         *  into a per-frame summary in debugState. */
+        /** How many frames the diagnostic logs in full. */
         private const val DIAG_FRAMES = 5
+
+        /**
+         * A frame more than this many times the requested pixel count is
+         * considered "HAL gave us something much bigger than asked" and is
+         * downscaled before Rust. A factor of 2 means 1280x720 (921K px)
+         * tolerates up to ~1.8M px without resize, and 1920x1080 (2.07M px)
+         * up to ~4.1M px. 4096x2160 is 8.8M and gets downscaled.
+         */
+        private const val DOWNSCALE_THRESHOLD = 2
     }
 
     @Volatile private var scannerHandle: Long = 0L
@@ -161,8 +157,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     private var preview: Preview? = null
     private var analysis: ImageAnalysis? = null
 
-    // Cached buffers. Allocated once per session and reused; per-frame
-    // allocation of Y / NV21 / downscaled planes is fatal on this device.
     private var yBuf: ByteArray? = null
     private var nv21Buf: ByteArray? = null
     private var downscaleBuf: ByteArray? = null
@@ -172,7 +166,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var lastNv21H = 0
     @Volatile private var lastNv21Rot = 0
 
-    /** Set by grabFrame, cleared after the next NV21 build. */
     @Volatile private var needNv21 = false
 
     @Volatile private var bufW = ANALYSIS_WIDTH
@@ -207,7 +200,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var kickStrategy = 0
     @Volatile private var kickCount = 0
 
-    // Diagnostic: last measured Y-plane stats.
     @Volatile private var diagW = 0
     @Volatile private var diagH = 0
     @Volatile private var diagStride = 0
@@ -383,13 +375,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "lastKickAt" to lastKickAt,
                             "kickStrategy" to kickStrategy,
                             "kickCount" to kickCount,
-                            "analysisMaxSize" to "${ANALYSIS_MAX_SIZE.width}x${ANALYSIS_MAX_SIZE.height}",
-                            "scanTargetSize" to
+                            "scanEnabled" to SCAN_ENABLED,
+                            "desiredSize" to
                                 "${targetSize(shortSide).width}x${targetSize(shortSide).height}",
                             "yBufCached" to (yBuf?.size ?: 0),
                             "nv21BufCached" to (nv21Buf?.size ?: 0),
                             "downscaleBufCached" to (downscaleBuf?.size ?: 0),
-                            "scanEnabled" to SCAN_ENABLED,
                             "diagW" to diagW,
                             "diagH" to diagH,
                             "diagStride" to diagStride,
@@ -615,20 +606,56 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
     }
 
+    /**
+     * Binds Preview and ImageAnalysis with a *shared* AspectRatioStrategy
+     * instance and identical ResolutionStrategies. This is the Google-
+     * recommended shape for a Preview + ImageAnalysis pair, and the shared
+     * instance is what stops CameraX from treating the two use cases as two
+     * different constraints and falling back to a zero-sized stream.
+     */
     private fun bindUseCases(st: SurfaceTexture) {
         val provider = cameraProvider ?: return
         provider.unbindAll()
         boundShortSide = shortSide
 
         val selector = CameraSelector.DEFAULT_BACK_CAMERA
-        val previewTargetSize = targetSize(shortSide)
-        val analysisTargetSize = Size(640,480)
+        val desiredSize = targetSize(shortSide)
+
+        // One AspectRatioStrategy, shared by both builders. Object identity
+        // matters to CameraX's SurfaceCombination negotiation.
+        val aspectRatioStrategy = AspectRatioStrategy(
+            AspectRatio.RATIO_16_9,
+            AspectRatioStrategy.FALLBACK_RULE_AUTO,
+        )
+
+        // Both use cases ask for the same size, and prefer a higher fallback
+        // if the exact one is not available — a bigger frame still decodes,
+        // a smaller one loses the detail the scanner needs.
+        val previewResolutionSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(aspectRatioStrategy)
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    desiredSize,
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                )
+            )
+            .build()
+
+        val analysisResolutionSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(aspectRatioStrategy)  // SAME instance
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    desiredSize,
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                )
+            )
+            .build()
 
         lastTargetRotation = uiRotation()
         displayRotationDegrees = rotationDegrees(lastTargetRotation)
 
         val previewUseCase = Preview.Builder()
-            .setTargetResolution(previewTargetSize)
+            .setResolutionSelector(previewResolutionSelector)
             .setTargetRotation(Surface.ROTATION_0)
             .build()
         previewUseCase.setSurfaceProvider { request: SurfaceRequest ->
@@ -654,17 +681,17 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         preview = previewUseCase
 
         val analysisUseCase = ImageAnalysis.Builder()
-            .setTargetResolution(analysisTargetSize)
+            .setResolutionSelector(analysisResolutionSelector)
             .setTargetRotation(lastTargetRotation)
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
         analysisUseCase.setAnalyzer(camExec, ::analyze)
         analysis = analysisUseCase
 
         android.util.Log.i(
             TAG,
-            "binding: preview=$previewTargetSize analysis=$analysisTargetSize " +
+            "binding: desired=$desiredSize aspect=16:9 sharedSelector=true " +
             "scanEnabled=$SCAN_ENABLED"
         )
 
@@ -675,6 +702,9 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         previewUseCase.resolutionInfo?.resolution?.let {
             bufW = it.width; bufH = it.height
+        }
+        analysisUseCase.resolutionInfo?.resolution?.let {
+            android.util.Log.i(TAG, "analysis resolved to ${it.width}x${it.height}")
         }
         recomputePreviewSize()
 
@@ -897,15 +927,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         return b
     }
 
-    /**
-     * Copies the Y plane into the cached [yBuf] and returns the logical size
-     * (which may be less than `yBuf.size` — the buffer is reused as-is).
-     *
-     * The Y plane of a YUV_420_888 ImageProxy has `rowStride` bytes per row
-     * and `height` rows, so the buffer's `remaining()` is usually
-     * `rowStride * height`, not `width * height`. Both are handled: the
-     * caller is told `rowStride` separately and measures the image with it.
-     */
     private fun copyYPlane(image: ImageProxy): Triple<ByteArray, Int, Int>? {
         val plane = image.planes[0]
         val remaining = plane.buffer.remaining()
@@ -915,16 +936,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         return Triple(buf, remaining, stride)
     }
 
-    /**
-     * Downscales a Y plane into [dst] (nearest-neighbour), honouring the
-     * source row padding. `dst` must be at least `dstW * dstH` bytes.
-     *
-     * Nearest-neighbour rather than averaging: the source is 2 to 3 times
-     * larger than the destination and the destination is what the scanner
-     * was built for; QR modules are high-contrast edges and sampling
-     * preserves them. Averaging would cost CPU for detail the detector
-     * resizes away anyway.
-     */
     private fun downscaleGrayInto(
         src: ByteArray,
         dst: ByteArray,
@@ -947,19 +958,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
     }
 
-    /**
-     * Cheap Y-plane statistics for the diagnostic.
-     *
-     * Samples every 64th pixel in each row (col += 64) rather than the whole
-     * plane: a 4096x2160 buffer is 8.8 MB and the point is a min, max and
-     * average rather than a pixel-exact histogram. 1/64 of a natural image
-     * is representative.
-     *
-     * Returns `(min, max, avg)`. `diagFirst16` is set as a side effect: the
-     * first 16 bytes of the buffer, hex-encoded with spaces — the very start
-     * of the Y-plane, which distinguishes "zeroed buffer" (all 00) from
-     * "white frame" (all FF) from "live picture" (mixed).
-     */
     private fun measureYPlane(
         y: ByteArray,
         w: Int,
@@ -996,7 +994,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         return Triple(mn, mx, avg)
     }
 
-    /// ImageProxy (YUV_420_888) to NV21, into the cached [nv21Buf].
     private fun toNv21(image: ImageProxy): ByteArray {
         val w = image.width
         val h = image.height
@@ -1027,7 +1024,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         return out
     }
 
-    /// Compresses the buffered frame to JPEG and brings it upright.
     private fun grabJpeg(): ByteArray? {
         val nv21 = lastNv21 ?: return null
         val w = lastNv21W
@@ -1052,11 +1048,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     }
 
     // ---------- per frame ----------
-    //
-    // In diagnostic mode (SCAN_ENABLED = false) nothing is passed to Rust.
-    // The Y plane is copied into a reused buffer, measured, and surfaced
-    // through debugState. In normal mode the Y plane is downscaled to what
-    // the scanner was built for and handed to submitScan.
     private fun analyze(image: ImageProxy) {
         try {
             if (image.width == 0 || image.height == 0) {
@@ -1081,7 +1072,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             val h = image.height
             val rot = image.imageInfo.rotationDegrees
 
-            // Copy the Y plane into a reused buffer.
             val copied = copyYPlane(image)
             if (copied == null) {
                 try { image.close() } catch (_: Throwable) {}
@@ -1089,8 +1079,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             }
             val (y, yLen, rowStride) = copied
 
-            // Optionally build NV21 for grabFrame. Only when asked — this is
-            // the expensive path and it is not needed on ordinary frames.
             if (scanning && needNv21) {
                 try {
                     val nv21 = toNv21(image)
@@ -1112,7 +1100,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
             try { image.close() } catch (_: Throwable) {}
 
-            // ---- Measure, always. ----
+            // Measure every frame, always — the diagnostic panel is the only
+            // way to know what arrived, on a phone with no computer attached.
             val stats = measureYPlane(y, w, h, rowStride)
             diagW = w
             diagH = h
@@ -1133,7 +1122,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 )
             }
 
-            // ---- Diagnostic gate ----
             if (!SCAN_ENABLED) {
                 analyzedFrames++
                 return
@@ -1152,19 +1140,41 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 return
             }
 
-            val scanTarget = targetSize(shortSide)
-            val dstSize = scanTarget.width * scanTarget.height
-            val dst = ensureDownscaleBuffer(dstSize)
-            downscaleGrayInto(
-                y, dst, w, h, rowStride, scanTarget.width, scanTarget.height,
-            )
+            // Downscale only if the frame is much bigger than requested.
+            val desiredSize = targetSize(shortSide)
+            val desiredPixels = desiredSize.width.toLong() * desiredSize.height
+            val framePixels = w.toLong() * h
 
-            analyzedFrames++
-            busy = true
-            try {
-                submitScan(dst, scanTarget.width, scanTarget.height, scanTarget.width, rot)
-            } catch (_: java.util.concurrent.RejectedExecutionException) {
-                busy = false
+            if (framePixels > desiredPixels * DOWNSCALE_THRESHOLD) {
+                // HAL gave something much bigger (e.g. 4096x2160 for a 720p
+                // request). Downscale; the raw buffer crashes Rust.
+                val dstSize = desiredSize.width * desiredSize.height
+                val dst = ensureDownscaleBuffer(dstSize)
+                downscaleGrayInto(
+                    y, dst, w, h, rowStride,
+                    desiredSize.width, desiredSize.height,
+                )
+                android.util.Log.i(
+                    TAG,
+                    "downscale: ${w}x$h -> ${desiredSize.width}x${desiredSize.height}",
+                )
+                analyzedFrames++
+                busy = true
+                try {
+                    submitScan(dst, desiredSize.width, desiredSize.height, desiredSize.width, rot)
+                } catch (_: java.util.concurrent.RejectedExecutionException) {
+                    busy = false
+                }
+            } else {
+                // Frame is at or near the requested size; pass it through
+                // untouched.
+                analyzedFrames++
+                busy = true
+                try {
+                    submitScan(y, w, h, rowStride, rot)
+                } catch (_: java.util.concurrent.RejectedExecutionException) {
+                    busy = false
+                }
             }
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "analyze failed: ${e.message}", e)
