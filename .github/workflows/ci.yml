@@ -197,3 +197,15 @@ jobs:
             ios)     flutter build ios --release --no-codesign ;;
             macos)   flutter build macos --release ;;
           esac
+
+      # Flutter writes the APK under build/app/outputs/flutter-apk/, not under
+      # android/app/build/. Paths are resolved from the workspace root, hence
+      # the wxscan/ prefix even though the build ran in a subdirectory.
+      - name: Upload APK
+        if: matrix.target == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: wxscan/packages/wxscan_live/example/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 30
