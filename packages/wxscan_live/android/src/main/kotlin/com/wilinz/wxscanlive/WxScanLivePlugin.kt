@@ -622,7 +622,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         val selector = CameraSelector.DEFAULT_BACK_CAMERA
         val previewTargetSize = targetSize(shortSide)
-        val analysisTargetSize = ANALYSIS_MAX_SIZE
+        val analysisTargetSize = Size(640,480)
 
         lastTargetRotation = uiRotation()
         displayRotationDegrees = rotationDegrees(lastTargetRotation)
