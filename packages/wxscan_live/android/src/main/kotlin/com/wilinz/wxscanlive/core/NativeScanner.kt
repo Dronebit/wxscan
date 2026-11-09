@@ -18,16 +18,44 @@ package com.wilinz.wxscanlive.core
  * [release].
  */
 object NativeScanner {
+    private const val TAG = "wxscan_live"
+
     init {
         // The Rust library has a DT_NEEDED entry for the TFLite C library, so the
         // loader normally brings it in; loading it first covers the cases where
         // it does not.
-        try { System.loadLibrary("LiteRt") } catch (_: Throwable) {}
+        //
+        // PATCH: log both loads. A failure here is *the* reason frames
+        // disappear silently later — `nativeReady = false` in the plugin, and
+        // nothing in Dart sees it. On Huawei this is the second-most-common
+        // cause of "preview works, nothing decodes".
+        try {
+            System.loadLibrary("LiteRt")
+            android.util.Log.i(TAG, "loaded libLiteRt.so")
+        } catch (e: Throwable) {
+            android.util.Log.w(
+                TAG,
+                "libLiteRt.so not loaded directly (may be resolved by DT_NEEDED): ${e.message}",
+            )
+        }
         // Not a leftover: the Rust crate behind the `wxscan` package keeps the
         // name `wxscan_core`, because it depends on the upstream `wxscan`
         // crate and cargo will not resolve a package against a dependency
         // sharing its own name. This is the library that crate produces.
-        System.loadLibrary("wxscan_core")
+        try {
+            System.loadLibrary("wxscan_core")
+            android.util.Log.i(TAG, "loaded libwxscan_core.so")
+        } catch (e: Throwable) {
+            android.util.Log.e(
+                TAG,
+                "libwxscan_core.so FAILED to load: ${e.message}",
+                e,
+            )
+            // Rethrown: the object is unusable without it, and a plugin that
+            // got here needs to fail loudly at the first JNI call rather than
+            // leave every frame to be dropped in silence.
+            throw e
+        }
     }
 
     /**
@@ -37,7 +65,14 @@ object NativeScanner {
      *
      * @return an opaque handle, or 0 if a model failed to load.
      */
-    fun create(detect: ByteArray, sr: ByteArray): Long = nativeCreate(detect, sr)
+    fun create(detect: ByteArray, sr: ByteArray): Long {
+        val h = nativeCreate(detect, sr)
+        android.util.Log.i(
+            TAG,
+            "NativeScanner.create(detect=${detect.size}B sr=${sr.size}B) = $h",
+        )
+        return h
+    }
 
     /**
      * Creates a scanner from weight files on disk.
@@ -52,18 +87,27 @@ object NativeScanner {
      */
     fun createFromPaths(detect: String?, sr: String?): Long {
         val id = nativeCreatePath(detect, sr)
-        if (id > 0) return id
+        if (id > 0) {
+            android.util.Log.i(
+                TAG,
+                "NativeScanner.createFromPaths(detect=$detect sr=$sr) = $id",
+            )
+            return id
+        }
         // The native side has no out-parameter to spare, so it answers a
         // failure with minus the status that explains it. See the Rust doc on
         // nativeCreatePath; the encoding ends here.
-        throw when (-id) {
-            STATUS_BAD_ARGUMENT -> ModelFileException("a model path is not valid text")
-            STATUS_UNREADABLE ->
-                ModelFileException("a model file could not be read: detect=$detect sr=$sr")
-            STATUS_WEIGHTS_REFUSED ->
-                ModelFileException("a model file was read but is not weights this build can load")
-            else -> ModelFileException("the scanner could not be created from those paths")
+        val reason = when (-id) {
+            STATUS_BAD_ARGUMENT -> "a model path is not valid text"
+            STATUS_UNREADABLE -> "a model file could not be read: detect=$detect sr=$sr"
+            STATUS_WEIGHTS_REFUSED -> "a model file was read but is not weights this build can load"
+            else -> "the scanner could not be created from those paths"
         }
+        android.util.Log.e(
+            TAG,
+            "NativeScanner.createFromPaths = $id ($reason)",
+        )
+        throw ModelFileException(reason)
     }
 
     /**
@@ -74,10 +118,16 @@ object NativeScanner {
      *   handle left over from a previous Dart isolate looks like after a hot
      *   restart.
      */
-    fun retain(handle: Long): Long = nativeRetain(handle)
+    fun retain(handle: Long): Long {
+        val r = nativeRetain(handle)
+        android.util.Log.i(TAG, "NativeScanner.retain($handle) = $r")
+        return r
+    }
 
     /** Gives a handle back. A handle of 0 is ignored. */
-    fun release(handle: Long) = nativeRelease(handle)
+    fun release(handle: Long) {
+        nativeRelease(handle)
+    }
 
     /**
      * Whether the scanner has its detector network loaded.
