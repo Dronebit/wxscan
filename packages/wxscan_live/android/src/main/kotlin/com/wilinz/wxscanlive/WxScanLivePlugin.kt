@@ -40,6 +40,7 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
+import java.util.Locale
 import java.util.concurrent.Executors
 
 /**
@@ -48,32 +49,46 @@ import java.util.concurrent.Executors
  * goes through ImageAnalysis, whose Y plane reaches Rust over JNI without
  * passing through Dart.
  *
- * **Huawei 0x0 bug — Variant A + downscale.**
+ * **Diagnostic mode (SCAN_ENABLED = false).**
  *
- * On some Huawei EMUI builds (STG-LX2 / P Smart 5G, Android 12, EMUI 12,
- * confirmed on the device this was written against) the analysis stream
- * receives zero-sized ImageProxy objects forever, at every preview-aligned
- * resolution (720p, 1080p, 4K), every output format and every backpressure
- * strategy. Preview renders fine, the device's capabilities include LEVEL_3
- * with YUV_REPROCESSING, and its guaranteed-configuration table says:
+ * A large Y-plane (4096x2160, 8.8 MB) crashes the native scanner. Before
+ * investigating why, the buffer has to be measured: is the HAL delivering a
+ * real picture, a zeroed buffer, or all-0xFF? While [SCAN_ENABLED] is false,
+ * nothing is passed to NativeScanner.scanFrame; every frame is copied into a
+ * reused buffer, sampled (every 64th pixel: min, max, avg), and the first 16
+ * bytes are hex-encoded. The summary lands in debugState and on the
+ * diagnostic panel. Flip [SCAN_ENABLED] to true once the summary proves the
+ * buffer holds a live picture; a crash then is about what Rust does with the
+ * input, not about whether the input exists.
+ *
+ * **Huawei 0x0 bug (unchanged).**
+ *
+ * On some Huawei EMUI builds (STG-LX2 / P Smart 5G, Android 12, EMUI 12) the
+ * analysis stream receives zero-sized ImageProxy objects at every
+ * preview-aligned resolution. Preview renders fine, the device's
+ * capabilities include LEVEL_3 with YUV_REPROCESSING, and its
+ * guaranteed-configuration table says:
  *
  *     PRIV PREVIEW | PRIV 640x480 | YUV MAXIMUM | RAW MAXIMUM
  *
  * For a combination with Preview, the only guaranteed YUV size is MAXIMUM
- * (4096x2160 on this device). Smaller YUV requests are outside the
- * guarantee, and this HAL answers them with a zero-sized buffer rather than
- * refusing the session.
+ * (4096x2160 here). Smaller YUV requests get a zero-sized buffer. So the
+ * analyser asks for [ANALYSIS_MAX_SIZE] by name.
  *
- * So the analyser asks for [ANALYSIS_MAX_SIZE] — MAXIMUM, by name. Frames
- * arrive. But Rust and the TFLite models were written for 1280x720 through
- * 3840x2160, not for 4096x2160: a raw 8.8 MB Y-plane at MAXIMUM crashes the
- * native scanner (a dimension check, an allocation, or the model's input
- * validation — the abort is immediate). The two facts have to be reconciled.
+ * **Buffer caching.**
  *
- * So: HAL requests MAXIMUM, frames arrive at MAXIMUM, and before each frame
- * reaches Rust the Y-plane is downscaled to whatever [shortSide] maps to —
- * the size Rust was built for. The scanner sees 720p, 1080p or 3840x2160,
- * exactly as it did before this change; only the HAL request changed.
+ * At 4096x2160 and ~30 fps, allocating fresh ByteArrays per frame (y at
+ * 8.8 MB, nv21 at 13 MB) is ~680 MB/s of allocations, which no GC keeps up
+ * with. Three buffers are cached and reused: [yBuf], [nv21Buf],
+ * [downscaleBuf]. NV21 is only built when grabFrame has actually asked for
+ * it (the picker, when several codes are in view).
+ *
+ * **try-catch.**
+ *
+ * Every callback and public method is wrapped in try-catch(Throwable). It
+ * does not catch a Rust panic that aborts via SIGABRT — that is not a Java
+ * exception. If the app still crashes after this, logcat will carry an
+ * `Abort message:` and the input to Rust needs inspecting.
  */
 class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     EventChannel.StreamHandler, ActivityAware, LifecycleOwner {
@@ -84,26 +99,9 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         private const val ANALYSIS_WIDTH = 1280
         private const val ANALYSIS_HEIGHT = 720
 
-        /**
-         * The YUV size the analyser asks the HAL for, regardless of what
-         * [shortSide] says.
-         *
-         * LEVEL_3 guarantees exactly one YUV size in combination with
-         * Preview, and that size is MAXIMUM. On the STG-LX2, MAXIMUM is
-         * 4096x2160 (the largest entry in its YUV_420_888 output-size list),
-         * and this is the only value the analyser receives non-zero frames
-         * for. Asking for anything smaller returns a zero-sized ImageProxy
-         * with no error.
-         *
-         * The frame that arrives is downscaled by [downscaleGray] before it
-         * reaches Rust: the scanner is built for 1280x720 through
-         * 3840x2160, not for 4096x2160, and passing the raw MAXIMUM buffer
-         * crashes it.
-         */
+        /** MAXIMUM YUV, the only size LEVEL_3 guarantees with Preview. */
         private val ANALYSIS_MAX_SIZE = Size(4096, 2160)
 
-        /** Short-side pixels to a target size, in landscape. This is what
-         *  the scanner receives, and the size the preview is laid out for. */
         private fun targetSize(shortSide: Int): Size = when (shortSide) {
             720 -> Size(1280, 720)
             1080 -> Size(1920, 1080)
@@ -114,6 +112,22 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         private const val ROTATION_CHECK_DELAY_MS = 120L
         private const val SETTLE_CHECKS = 3
         private const val KICK_COOLDOWN_MS = 1000L
+
+        /**
+         * When true, frames are passed to NativeScanner.scanFrame.
+         *
+         * Set to false for the current investigation. Every frame is still
+         * copied and measured, and the result is surfaced through
+         * debugState; nothing reaches Rust. That is what makes it safe to
+         * look at the buffer without risking the crash that prompted the
+         * diagnostic. Flip to true once the summary proves the buffer holds
+         * a picture.
+         */
+        private const val SCAN_ENABLED = false
+
+        /** How many frames the diagnostic logs in full, before it settles
+         *  into a per-frame summary in debugState. */
+        private const val DIAG_FRAMES = 5
     }
 
     @Volatile private var scannerHandle: Long = 0L
@@ -147,10 +161,19 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     private var preview: Preview? = null
     private var analysis: ImageAnalysis? = null
 
+    // Cached buffers. Allocated once per session and reused; per-frame
+    // allocation of Y / NV21 / downscaled planes is fatal on this device.
+    private var yBuf: ByteArray? = null
+    private var nv21Buf: ByteArray? = null
+    private var downscaleBuf: ByteArray? = null
+
     @Volatile private var lastNv21: ByteArray? = null
     @Volatile private var lastNv21W = 0
     @Volatile private var lastNv21H = 0
     @Volatile private var lastNv21Rot = 0
+
+    /** Set by grabFrame, cleared after the next NV21 build. */
+    @Volatile private var needNv21 = false
 
     @Volatile private var bufW = ANALYSIS_WIDTH
     @Volatile private var bufH = ANALYSIS_HEIGHT
@@ -184,36 +207,55 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var kickStrategy = 0
     @Volatile private var kickCount = 0
 
+    // Diagnostic: last measured Y-plane stats.
+    @Volatile private var diagW = 0
+    @Volatile private var diagH = 0
+    @Volatile private var diagStride = 0
+    @Volatile private var diagLen = 0
+    @Volatile private var diagMin = 0
+    @Volatile private var diagMax = 0
+    @Volatile private var diagAvg = 0.0
+    @Volatile private var diagFirst16 = ""
+    @Volatile private var diagFramesSeen = 0L
+
     // ---------- FlutterPlugin ----------
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        appContext = binding.applicationContext
-        textureRegistry = binding.textureRegistry
-        methodChannel = MethodChannel(binding.binaryMessenger, "wxscan_live")
-        methodChannel.setMethodCallHandler(this)
-        eventChannel = EventChannel(binding.binaryMessenger, "wxscan_live/scan")
-        eventChannel.setStreamHandler(this)
-        sizeChannel = EventChannel(binding.binaryMessenger, "wxscan_live/preview_size")
-        sizeChannel.setStreamHandler(sizeHandler)
-        nativeReady = try {
-            val ping = NativeScanner.ping()
-            android.util.Log.i(TAG, "NativeScanner.ping() = '$ping'")
-            ping == "wxscan"
+        try {
+            appContext = binding.applicationContext
+            textureRegistry = binding.textureRegistry
+            methodChannel = MethodChannel(binding.binaryMessenger, "wxscan_live")
+            methodChannel.setMethodCallHandler(this)
+            eventChannel = EventChannel(binding.binaryMessenger, "wxscan_live/scan")
+            eventChannel.setStreamHandler(this)
+            sizeChannel = EventChannel(binding.binaryMessenger, "wxscan_live/preview_size")
+            sizeChannel.setStreamHandler(sizeHandler)
+            nativeReady = try {
+                val ping = NativeScanner.ping()
+                android.util.Log.i(TAG, "NativeScanner.ping() = '$ping'")
+                ping == "wxscan"
+            } catch (e: Throwable) {
+                android.util.Log.e(TAG, "NativeScanner.ping FAILED", e)
+                false
+            }
         } catch (e: Throwable) {
-            android.util.Log.e(TAG, "NativeScanner.ping FAILED — library not loaded", e)
-            false
+            android.util.Log.e(TAG, "onAttachedToEngine failed", e)
         }
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        methodChannel.setMethodCallHandler(null)
-        eventChannel.setStreamHandler(null)
-        sizeChannel.setStreamHandler(null)
-        teardown()
-        if (lifecycleRegistry.currentState.isAtLeast(Lifecycle.State.CREATED)) {
-            lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+        try {
+            methodChannel.setMethodCallHandler(null)
+            eventChannel.setStreamHandler(null)
+            sizeChannel.setStreamHandler(null)
+            teardown()
+            if (lifecycleRegistry.currentState.isAtLeast(Lifecycle.State.CREATED)) {
+                lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+            }
+            worker.shutdown()
+            camExec.shutdown()
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "onDetachedFromEngine failed", e)
         }
-        worker.shutdown()
-        camExec.shutdown()
     }
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) { activity = binding.activity }
@@ -227,152 +269,177 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     // ---------- MethodChannel ----------
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
-        when (call.method) {
-            "initialize" -> {
-                call.argument<Int>("shortSide")?.let { shortSide = it }
-                handleInitialize(
-                    result,
-                    call.argument<ByteArray>("detectModel"),
-                    call.argument<ByteArray>("srModel"),
-                    call.argument<String>("detectModelPath"),
-                    call.argument<String>("srModelPath"),
-                    call.argument<Number>("scannerHandle")?.toLong() ?: 0L,
-                )
-            }
-            "setResolution" -> {
-                val want = call.argument<Int>("shortSide") ?: ANALYSIS_HEIGHT
-                if (want == shortSide || cameraProvider == null) {
-                    result.success(null)
-                } else {
-                    shortSide = want
-                    main.post {
-                        try {
-                            rebindUseCases()
-                            result.success(null)
-                        } catch (e: Throwable) {
-                            result.error("RESOLUTION_ERROR", e.message, null)
+        try {
+            when (call.method) {
+                "initialize" -> {
+                    call.argument<Int>("shortSide")?.let { shortSide = it }
+                    handleInitialize(
+                        result,
+                        call.argument<ByteArray>("detectModel"),
+                        call.argument<ByteArray>("srModel"),
+                        call.argument<String>("detectModelPath"),
+                        call.argument<String>("srModelPath"),
+                        call.argument<Number>("scannerHandle")?.toLong() ?: 0L,
+                    )
+                }
+                "setResolution" -> {
+                    val want = call.argument<Int>("shortSide") ?: ANALYSIS_HEIGHT
+                    if (want == shortSide || cameraProvider == null) {
+                        result.success(null)
+                    } else {
+                        shortSide = want
+                        main.post {
+                            try {
+                                rebindUseCases()
+                                result.success(null)
+                            } catch (e: Throwable) {
+                                android.util.Log.e(TAG, "rebind failed", e)
+                                result.error("RESOLUTION_ERROR", e.message, null)
+                            }
                         }
                     }
                 }
-            }
-            "setScanning" -> {
-                scanning = call.argument<Boolean>("value") ?: true
-                result.success(null)
-            }
-            "setTorch" -> {
-                val on = call.argument<Boolean>("value") ?: false
-                try {
-                    camera?.cameraControl?.enableTorch(on)
-                    result.success(null)
-                } catch (e: Throwable) {
-                    result.error("TORCH_ERROR", e.message, null)
-                }
-            }
-            "hasTorch" -> result.success(camera?.cameraInfo?.hasFlashUnit() ?: false)
-            "grabFrame" -> {
-                try { result.success(grabJpeg()) }
-                catch (e: Throwable) {
-                    android.util.Log.e(TAG, "grabFrame err: ${e.message}")
+                "setScanning" -> {
+                    scanning = call.argument<Boolean>("value") ?: true
                     result.success(null)
                 }
-            }
-            "setZoom" -> {
-                val want = (call.argument<Double>("ratio") ?: 1.0).toFloat()
-                try {
-                    val info = camera?.cameraInfo
-                    val state = info?.zoomState?.value
-                    if (state == null) {
-                        result.success(1.0)
-                    } else {
-                        val clamped = want.coerceIn(state.minZoomRatio, state.maxZoomRatio)
-                        camera?.cameraControl?.setZoomRatio(clamped)
-                        result.success(clamped.toDouble())
+                "setTorch" -> {
+                    val on = call.argument<Boolean>("value") ?: false
+                    try {
+                        camera?.cameraControl?.enableTorch(on)
+                        result.success(null)
+                    } catch (e: Throwable) {
+                        result.error("TORCH_ERROR", e.message, null)
                     }
-                } catch (e: Throwable) {
-                    result.error("ZOOM_ERROR", e.message, null)
                 }
-            }
-            "focusAt" -> {
-                val x = call.argument<Double>("x") ?: -1.0
-                val y = call.argument<Double>("y") ?: -1.0
-                result.success(focusAt(x, y))
-            }
-            "zoomRange" -> {
-                val state = camera?.cameraInfo?.zoomState?.value
-                result.success(
-                    mapOf(
-                        "min" to (state?.minZoomRatio ?: 1f).toDouble(),
-                        "max" to (state?.maxZoomRatio ?: 1f).toDouble(),
-                        "current" to (state?.zoomRatio ?: 1f).toDouble(),
-                    )
-                )
-            }
-            "kickStream" -> {
-                main.post { kickAnalysisStream(force = true) }
-                result.success(null)
-            }
-            "debugState" -> {
-                result.success(
-                    mapOf(
-                        "nativeReady" to nativeReady,
-                        "modelsLoaded" to modelsLoaded,
-                        "scannerHandle" to scannerHandle,
-                        "busy" to busy,
-                        "scanning" to scanning,
-                        "analyzedFrames" to analyzedFrames,
-                        "skippedFrames" to skippedFrames,
-                        "emptyFrames" to emptyFrames,
-                        "previewW" to previewW,
-                        "previewH" to previewH,
-                        "bufW" to bufW,
-                        "bufH" to bufH,
-                        "shortSide" to shortSide,
-                        "starting" to starting,
-                        "sessionId" to sessionId,
-                        "boundShortSide" to boundShortSide,
-                        "hasProvider" to (cameraProvider != null),
-                        "hasCamera" to (camera != null),
-                        "hasAnalysis" to (analysis != null),
-                        "hasPreview" to (preview != null),
-                        "lastNv21" to (lastNv21?.size ?: 0),
-                        "lastKickAt" to lastKickAt,
-                        "kickStrategy" to kickStrategy,
-                        "kickCount" to kickCount,
-                        "analysisMaxSize" to "${ANALYSIS_MAX_SIZE.width}x${ANALYSIS_MAX_SIZE.height}",
-                        "scanTargetSize" to
-                            "${targetSize(shortSide).width}x${targetSize(shortSide).height}",
-                    )
-                )
-            }
-            "selfTestNative" -> {
-                val gray = call.argument<ByteArray>("gray")
-                val w = call.argument<Int>("width") ?: 0
-                val h = call.argument<Int>("height") ?: 0
-                val rot = call.argument<Int>("rotation") ?: 0
-                if (gray == null || w <= 0 || h <= 0) {
-                    result.error("BAD_ARGS", "missing grayscale data", null); return
-                }
-                worker.execute {
-                    val stride = w + 16
-                    val padded = ByteArray(stride * h)
-                    for (y in 0 until h) {
-                        System.arraycopy(gray, y * w, padded, y * stride, w)
+                "hasTorch" -> result.success(camera?.cameraInfo?.hasFlashUnit() ?: false)
+                "grabFrame" -> {
+                    try {
+                        needNv21 = true
+                        result.success(grabJpeg())
+                    } catch (e: Throwable) {
+                        android.util.Log.e(TAG, "grabFrame err", e)
+                        result.success(null)
                     }
-                    val t0 = android.os.SystemClock.elapsedRealtime()
-                    val json = try {
-                        NativeScanner.scanFrame(scannerHandle, padded, w, h, stride, rot, false)
-                    } catch (e: Throwable) { "ERR ${e.message}" }
-                    val dt = android.os.SystemClock.elapsedRealtime() - t0
-                    android.util.Log.i(TAG, "selfTestNative rot=$rot ${dt}ms -> $json")
-                    main.post { result.success(json) }
                 }
+                "setZoom" -> {
+                    val want = (call.argument<Double>("ratio") ?: 1.0).toFloat()
+                    try {
+                        val state = camera?.cameraInfo?.zoomState?.value
+                        if (state == null) {
+                            result.success(1.0)
+                        } else {
+                            val clamped = want.coerceIn(state.minZoomRatio, state.maxZoomRatio)
+                            camera?.cameraControl?.setZoomRatio(clamped)
+                            result.success(clamped.toDouble())
+                        }
+                    } catch (e: Throwable) {
+                        result.error("ZOOM_ERROR", e.message, null)
+                    }
+                }
+                "focusAt" -> {
+                    val x = call.argument<Double>("x") ?: -1.0
+                    val y = call.argument<Double>("y") ?: -1.0
+                    result.success(focusAt(x, y))
+                }
+                "zoomRange" -> {
+                    val state = camera?.cameraInfo?.zoomState?.value
+                    result.success(
+                        mapOf(
+                            "min" to (state?.minZoomRatio ?: 1f).toDouble(),
+                            "max" to (state?.maxZoomRatio ?: 1f).toDouble(),
+                            "current" to (state?.zoomRatio ?: 1f).toDouble(),
+                        )
+                    )
+                }
+                "kickStream" -> {
+                    main.post { try { kickAnalysisStream(force = true) } catch (_: Throwable) {} }
+                    result.success(null)
+                }
+                "debugState" -> {
+                    result.success(
+                        mapOf(
+                            "nativeReady" to nativeReady,
+                            "modelsLoaded" to modelsLoaded,
+                            "scannerHandle" to scannerHandle,
+                            "busy" to busy,
+                            "scanning" to scanning,
+                            "analyzedFrames" to analyzedFrames,
+                            "skippedFrames" to skippedFrames,
+                            "emptyFrames" to emptyFrames,
+                            "previewW" to previewW,
+                            "previewH" to previewH,
+                            "bufW" to bufW,
+                            "bufH" to bufH,
+                            "shortSide" to shortSide,
+                            "starting" to starting,
+                            "sessionId" to sessionId,
+                            "boundShortSide" to boundShortSide,
+                            "hasProvider" to (cameraProvider != null),
+                            "hasCamera" to (camera != null),
+                            "hasAnalysis" to (analysis != null),
+                            "hasPreview" to (preview != null),
+                            "lastNv21" to (lastNv21?.size ?: 0),
+                            "lastKickAt" to lastKickAt,
+                            "kickStrategy" to kickStrategy,
+                            "kickCount" to kickCount,
+                            "analysisMaxSize" to "${ANALYSIS_MAX_SIZE.width}x${ANALYSIS_MAX_SIZE.height}",
+                            "scanTargetSize" to
+                                "${targetSize(shortSide).width}x${targetSize(shortSide).height}",
+                            "yBufCached" to (yBuf?.size ?: 0),
+                            "nv21BufCached" to (nv21Buf?.size ?: 0),
+                            "downscaleBufCached" to (downscaleBuf?.size ?: 0),
+                            "scanEnabled" to SCAN_ENABLED,
+                            "diagW" to diagW,
+                            "diagH" to diagH,
+                            "diagStride" to diagStride,
+                            "diagLen" to diagLen,
+                            "diagMin" to diagMin,
+                            "diagMax" to diagMax,
+                            "diagAvg" to diagAvg,
+                            "diagFirst16" to diagFirst16,
+                            "diagFramesSeen" to diagFramesSeen,
+                        )
+                    )
+                }
+                "selfTestNative" -> {
+                    val gray = call.argument<ByteArray>("gray")
+                    val w = call.argument<Int>("width") ?: 0
+                    val h = call.argument<Int>("height") ?: 0
+                    val rot = call.argument<Int>("rotation") ?: 0
+                    if (gray == null || w <= 0 || h <= 0) {
+                        result.error("BAD_ARGS", "missing grayscale data", null); return
+                    }
+                    worker.execute {
+                        try {
+                            val stride = w + 16
+                            val padded = ByteArray(stride * h)
+                            for (yy in 0 until h) {
+                                System.arraycopy(gray, yy * w, padded, yy * stride, w)
+                            }
+                            val t0 = android.os.SystemClock.elapsedRealtime()
+                            val json = try {
+                                NativeScanner.scanFrame(scannerHandle, padded, w, h, stride, rot, false)
+                            } catch (e: Throwable) { "ERR ${e.message}" }
+                            val dt = android.os.SystemClock.elapsedRealtime() - t0
+                            android.util.Log.i(TAG, "selfTestNative rot=$rot ${dt}ms -> $json")
+                            main.post { result.success(json) }
+                        } catch (e: Throwable) {
+                            android.util.Log.e(TAG, "selfTestNative failed", e)
+                            main.post { result.success("ERR ${e.message}") }
+                        }
+                    }
+                }
+                "dispose" -> {
+                    val session = call.argument<Number>("sessionId")?.toLong() ?: 0L
+                    if (session == 0L || session == sessionId) teardown()
+                    result.success(null)
+                }
+                else -> result.notImplemented()
             }
-            "dispose" -> {
-                val session = call.argument<Number>("sessionId")?.toLong() ?: 0L
-                if (session == 0L || session == sessionId) teardown()
-                result.success(null)
-            }
-            else -> result.notImplemented()
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "onMethodCall(${call.method}) failed", e)
+            try { result.error("PLUGIN_ERROR", e.message, null) } catch (_: Throwable) {}
         }
     }
 
@@ -383,66 +450,63 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         srPath: String?,
         borrowed: Long,
     ) {
-        releaseScanner()
+        try {
+            releaseScanner()
 
-        if (borrowed != 0L) {
-            scannerHandle = try {
-                NativeScanner.retain(borrowed)
-            } catch (e: Throwable) {
-                android.util.Log.e(TAG, "scanner retain FAILED borrowed=$borrowed", e)
-                0L
+            if (borrowed != 0L) {
+                scannerHandle = try {
+                    NativeScanner.retain(borrowed)
+                } catch (e: Throwable) {
+                    android.util.Log.e(TAG, "scanner retain FAILED borrowed=$borrowed", e)
+                    0L
+                }
+                if (scannerHandle != 0L) {
+                    modelsLoaded = try {
+                        NativeScanner.hasDetector(scannerHandle)
+                    } catch (_: Throwable) { false }
+                    return
+                }
             }
-            if (scannerHandle != 0L) {
-                modelsLoaded = try {
-                    NativeScanner.hasDetector(scannerHandle)
-                } catch (_: Throwable) { false }
-                android.util.Log.i(
-                    TAG,
-                    "scanner borrowed: handle=$scannerHandle modelsLoaded=$modelsLoaded",
-                )
-                return
-            }
-        }
 
-        val empty = ByteArray(0)
-        val fromPaths = detectPath != null || srPath != null
-        scannerHandle = try {
-            val h = if (fromPaths) NativeScanner.createFromPaths(detectPath, srPath)
-                    else NativeScanner.create(detect ?: empty, sr ?: empty)
-            android.util.Log.i(
-                TAG,
-                "scanner created: handle=$h paths=$fromPaths " +
-                "detectPath=$detectPath srPath=$srPath",
-            )
-            h
-        } catch (e: Throwable) {
-            android.util.Log.e(
-                TAG,
-                "scanner create FAILED paths=$fromPaths " +
-                "detectPath=$detectPath srPath=$srPath",
-                e,
-            )
-            0L
-        }
-        modelsLoaded = scannerHandle != 0L && (detect != null || detectPath != null)
-        if (scannerHandle == 0L) {
+            val empty = ByteArray(0)
+            val fromPaths = detectPath != null || srPath != null
             scannerHandle = try {
-                val h = NativeScanner.create(empty, empty)
-                android.util.Log.w(TAG, "scanner fallback (no weights): handle=$h")
+                val h = if (fromPaths) NativeScanner.createFromPaths(detectPath, srPath)
+                        else NativeScanner.create(detect ?: empty, sr ?: empty)
+                android.util.Log.i(TAG, "scanner created: handle=$h paths=$fromPaths")
                 h
             } catch (e: Throwable) {
-                android.util.Log.e(TAG, "scanner fallback FAILED", e)
+                android.util.Log.e(TAG, "scanner create FAILED", e)
                 0L
             }
+            modelsLoaded = scannerHandle != 0L && (detect != null || detectPath != null)
+            if (scannerHandle == 0L) {
+                scannerHandle = try {
+                    val h = NativeScanner.create(empty, empty)
+                    android.util.Log.w(TAG, "scanner fallback (no weights): handle=$h")
+                    h
+                } catch (e: Throwable) {
+                    android.util.Log.e(TAG, "scanner fallback FAILED", e)
+                    0L
+                }
+            }
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "ensureScanner failed", e)
+            scannerHandle = 0L
+            modelsLoaded = false
         }
     }
 
     private fun releaseScanner() {
-        if (scannerHandle == 0L) return
-        val h = scannerHandle
-        scannerHandle = 0L
-        modelsLoaded = false
-        worker.execute { try { NativeScanner.release(h) } catch (_: Throwable) {} }
+        try {
+            if (scannerHandle == 0L) return
+            val h = scannerHandle
+            scannerHandle = 0L
+            modelsLoaded = false
+            worker.execute { try { NativeScanner.release(h) } catch (_: Throwable) {} }
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "releaseScanner failed", e)
+        }
     }
 
     private fun handleInitialize(
@@ -453,18 +517,29 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         srPath: String?,
         borrowed: Long,
     ) {
-        if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.CAMERA)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            activity?.requestPermissions(arrayOf(Manifest.permission.CAMERA), 0x0C0DE)
-            result.error(
-                "NO_PERMISSION",
-                "camera permission not granted; a request was sent, try again once it is",
-                null,
-            )
-            return
+        try {
+            if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                activity?.requestPermissions(arrayOf(Manifest.permission.CAMERA), 0x0C0DE)
+                result.error(
+                    "NO_PERMISSION",
+                    "camera permission not granted; a request was sent, try again once it is",
+                    null,
+                )
+                return
+            }
+            main.post {
+                try { bindCamera(result, detect, sr, detectPath, srPath, borrowed) }
+                catch (e: Throwable) {
+                    android.util.Log.e(TAG, "bindCamera failed", e)
+                    try { result.error("INIT_ERROR", e.message, null) } catch (_: Throwable) {}
+                }
+            }
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "handleInitialize failed", e)
+            try { result.error("INIT_ERROR", e.message, null) } catch (_: Throwable) {}
         }
-        main.post { bindCamera(result, detect, sr, detectPath, srPath, borrowed) }
     }
 
     private fun infoMap(textureId: Long): Map<String, Any> = mapOf(
@@ -485,23 +560,25 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         srPath: String?,
         borrowed: Long,
     ) {
-        val bound = textureEntry
-        if (bound != null && cameraProvider != null) {
-            sessionId = ++lastSessionId
-            ensureScanner(detect, sr, detectPath, srPath, borrowed)
-            if (shortSide != boundShortSide) {
-                try { rebindUseCases() } catch (_: Throwable) {}
-            }
-            result.success(infoMap(bound.id()))
-            return
-        }
-        if (starting) {
-            result.error("BUSY", "the camera is already starting", null)
-            return
-        }
-        ensureScanner(detect, sr, detectPath, srPath, borrowed)
-        starting = true
         try {
+            val bound = textureEntry
+            if (bound != null && cameraProvider != null) {
+                sessionId = ++lastSessionId
+                ensureScanner(detect, sr, detectPath, srPath, borrowed)
+                if (shortSide != boundShortSide) {
+                    try { rebindUseCases() } catch (e: Throwable) {
+                        android.util.Log.e(TAG, "rebind on takeover failed", e)
+                    }
+                }
+                result.success(infoMap(bound.id()))
+                return
+            }
+            if (starting) {
+                result.error("BUSY", "the camera is already starting", null)
+                return
+            }
+            ensureScanner(detect, sr, detectPath, srPath, borrowed)
+            starting = true
             lifecycleRegistry.currentState = Lifecycle.State.RESUMED
             textureEntry?.let { try { it.release() } catch (_: Throwable) {} }
             val entry = textureRegistry.createSurfaceTexture()
@@ -510,24 +587,30 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
             val future = ProcessCameraProvider.getInstance(appContext)
             future.addListener({
-                if (!starting) {
-                    result.error("CANCELLED", "the camera was disposed while starting", null)
-                    return@addListener
-                }
                 try {
-                    val provider = future.get()
-                    cameraProvider = provider
-                    bindUseCases(st)
-                    sessionId = ++lastSessionId
-                    starting = false
-                    main.post { result.success(infoMap(entry.id())) }
+                    if (!starting) {
+                        result.error("CANCELLED", "the camera was disposed while starting", null)
+                        return@addListener
+                    }
+                    try {
+                        val provider = future.get()
+                        cameraProvider = provider
+                        bindUseCases(st)
+                        sessionId = ++lastSessionId
+                        starting = false
+                        main.post { result.success(infoMap(entry.id())) }
+                    } catch (e: Throwable) {
+                        starting = false
+                        android.util.Log.e(TAG, "bindUseCases failed", e)
+                        result.error("INIT_ERROR", e.message, null)
+                    }
                 } catch (e: Throwable) {
-                    starting = false
-                    result.error("INIT_ERROR", e.message, null)
+                    android.util.Log.e(TAG, "future listener failed", e)
                 }
             }, ContextCompat.getMainExecutor(appContext))
         } catch (e: Throwable) {
             starting = false
+            android.util.Log.e(TAG, "bindCamera failed", e)
             result.error("INIT_ERROR", e.message, null)
         }
     }
@@ -538,7 +621,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         boundShortSide = shortSide
 
         val selector = CameraSelector.DEFAULT_BACK_CAMERA
-
         val previewTargetSize = targetSize(shortSide)
         val analysisTargetSize = ANALYSIS_MAX_SIZE
 
@@ -550,19 +632,23 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             .setTargetRotation(Surface.ROTATION_0)
             .build()
         previewUseCase.setSurfaceProvider { request: SurfaceRequest ->
-            val res = request.resolution
-            android.util.Log.i(
-                TAG,
-                "surface request ${res.width}x${res.height} (current buf=${bufW}x$bufH)"
-            )
-            st.setDefaultBufferSize(res.width, res.height)
-            bufW = res.width
-            bufH = res.height
-            val surface = Surface(st)
-            previewSurface = surface
-            recomputePreviewSize()
-            request.provideSurface(surface, ContextCompat.getMainExecutor(appContext)) {
-                surface.release()
+            try {
+                val res = request.resolution
+                android.util.Log.i(
+                    TAG,
+                    "surface request ${res.width}x${res.height} (current buf=${bufW}x$bufH)"
+                )
+                st.setDefaultBufferSize(res.width, res.height)
+                bufW = res.width
+                bufH = res.height
+                val surface = Surface(st)
+                previewSurface = surface
+                recomputePreviewSize()
+                request.provideSurface(surface, ContextCompat.getMainExecutor(appContext)) {
+                    try { surface.release() } catch (_: Throwable) {}
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e(TAG, "surfaceProvider failed", e)
             }
         }
         preview = previewUseCase
@@ -578,8 +664,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         android.util.Log.i(
             TAG,
-            "binding (Variant A + downscale): preview=$previewTargetSize " +
-            "analysis=$analysisTargetSize -> scanned at $previewTargetSize",
+            "binding: preview=$previewTargetSize analysis=$analysisTargetSize " +
+            "scanEnabled=$SCAN_ENABLED"
         )
 
         camera = provider.bindToLifecycle(
@@ -595,24 +681,25 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         emptyFrames = 0
         kickStrategy = 0
         lastKickAt = 0
+        diagFramesSeen = 0
 
-        main.postDelayed({ kickAnalysisStream(force = false) }, 400L)
-        main.postDelayed({ kickAnalysisStream(force = false) }, 1400L)
+        main.postDelayed({ try { kickAnalysisStream(force = false) } catch (_: Throwable) {} }, 400L)
+        main.postDelayed({ try { kickAnalysisStream(force = false) } catch (_: Throwable) {} }, 1400L)
 
         focusAt(0.5, 0.5)
     }
 
     private fun kickAnalysisStream(force: Boolean = false) {
-        val cam = camera ?: return
-        val now = android.os.SystemClock.elapsedRealtime()
-        if (!force && now - lastKickAt < KICK_COOLDOWN_MS) return
-        lastKickAt = now
-        kickCount++
-
-        val strategy = if (force) 0 else kickStrategy % 3
-        if (!force) kickStrategy++
-
         try {
+            val cam = camera ?: return
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (!force && now - lastKickAt < KICK_COOLDOWN_MS) return
+            lastKickAt = now
+            kickCount++
+
+            val strategy = if (force) 0 else kickStrategy % 3
+            if (!force) kickStrategy++
+
             when (strategy) {
                 0 -> {
                     val current = cam.cameraInfo.zoomState.value?.zoomRatio ?: 1.0f
@@ -622,28 +709,27 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     main.postDelayed({
                         try { cam.cameraControl.setZoomRatio(base) } catch (_: Throwable) {}
                     }, 120L)
-                    android.util.Log.i(TAG, "kick #$kickCount: zoom nudge")
                 }
                 1 -> {
                     cam.cameraControl.enableTorch(true)
                     main.postDelayed({
                         try { cam.cameraControl.enableTorch(false) } catch (_: Throwable) {}
                     }, 25L)
-                    android.util.Log.i(TAG, "kick #$kickCount: torch blip")
                 }
-                2 -> {
-                    focusAt(0.5, 0.5)
-                    android.util.Log.i(TAG, "kick #$kickCount: af trigger")
-                }
+                2 -> focusAt(0.5, 0.5)
             }
         } catch (e: Throwable) {
-            android.util.Log.w(TAG, "kick #$kickCount failed: ${e.message}")
+            android.util.Log.w(TAG, "kick failed: ${e.message}")
         }
     }
 
     private fun rebindUseCases() {
-        val st = textureEntry?.surfaceTexture() ?: return
-        bindUseCases(st)
+        try {
+            val st = textureEntry?.surfaceTexture() ?: return
+            bindUseCases(st)
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "rebindUseCases failed", e)
+        }
     }
 
     private fun displayRotation(): Int =
@@ -653,25 +739,29 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         } catch (_: Throwable) { Surface.ROTATION_0 }
 
     private fun startOrientationListener() {
-        val ctx = activity ?: appContext
-        orientationListener?.disable()
-        orientationListener = object : OrientationEventListener(ctx) {
-            override fun onOrientationChanged(orientation: Int) {
-                scheduleRotationCheck()
-            }
-        }.apply { if (canDetectOrientation()) enable() }
+        try {
+            val ctx = activity ?: appContext
+            orientationListener?.disable()
+            orientationListener = object : OrientationEventListener(ctx) {
+                override fun onOrientationChanged(orientation: Int) {
+                    try { scheduleRotationCheck() } catch (_: Throwable) {}
+                }
+            }.apply { if (canDetectOrientation()) enable() }
 
-        configCallback?.let { activity?.unregisterComponentCallbacks(it) }
-        configCallback = object : ComponentCallbacks {
-            override fun onConfigurationChanged(newConfig: Configuration) {
-                scheduleRotationCheck()
+            configCallback?.let { activity?.unregisterComponentCallbacks(it) }
+            configCallback = object : ComponentCallbacks {
+                override fun onConfigurationChanged(newConfig: Configuration) {
+                    try { scheduleRotationCheck() } catch (_: Throwable) {}
+                }
+                override fun onLowMemory() {}
             }
-            override fun onLowMemory() {}
+            @Suppress("DEPRECATION")
+            activity?.registerComponentCallbacks(configCallback!!)
+
+            scheduleRotationCheck()
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "startOrientationListener failed", e)
         }
-        @Suppress("DEPRECATION")
-        activity?.registerComponentCallbacks(configCallback!!)
-
-        scheduleRotationCheck()
     }
 
     private fun scheduleRotationCheck() {
@@ -681,18 +771,21 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private val rotationCheck = object : Runnable {
         override fun run() {
-            val rot = uiRotation()
-            if (rot != lastTargetRotation) {
-                lastTargetRotation = rot
-                analysis?.targetRotation = rot
-                displayRotationDegrees = rotationDegrees(rot)
-                android.util.Log.i(TAG, "ui rotated -> ${displayRotationDegrees}deg")
-                pushPreviewSize()
-                settleChecksLeft = SETTLE_CHECKS
-            } else {
-                settleChecksLeft--
+            try {
+                val rot = uiRotation()
+                if (rot != lastTargetRotation) {
+                    lastTargetRotation = rot
+                    analysis?.targetRotation = rot
+                    displayRotationDegrees = rotationDegrees(rot)
+                    pushPreviewSize()
+                    settleChecksLeft = SETTLE_CHECKS
+                } else {
+                    settleChecksLeft--
+                }
+                if (settleChecksLeft > 0) main.postDelayed(this, ROTATION_CHECK_DELAY_MS)
+            } catch (e: Throwable) {
+                android.util.Log.e(TAG, "rotationCheck failed", e)
             }
-            if (settleChecksLeft > 0) main.postDelayed(this, ROTATION_CHECK_DELAY_MS)
         }
     }
 
@@ -725,10 +818,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         val w = if (rot % 180 == 0) bufW else bufH
         val h = if (rot % 180 == 0) bufH else bufW
         if (w == previewW && h == previewH) return
-        android.util.Log.i(
-            TAG,
-            "preview buf=${bufW}x$bufH sensor=$sensor rot=$rot -> ${w}x$h"
-        )
         previewW = w
         previewH = h
         previewRotation = rot
@@ -736,7 +825,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     }
 
     private fun pushPreviewSize() {
-        sizeHandler.sink?.success(previewSizeMap())
+        try { sizeHandler.sink?.success(previewSizeMap()) } catch (_: Throwable) {}
     }
 
     private fun focusAt(x: Double, y: Double): Boolean {
@@ -774,45 +863,77 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         @Volatile var sink: EventChannel.EventSink? = null
         override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
             sink = events
-            events?.success(previewSizeMap())
+            try { events?.success(previewSizeMap()) } catch (_: Throwable) {}
         }
         override fun onCancel(arguments: Any?) { sink = null }
     }
 
+    // ---------- cached buffer helpers ----------
+
+    private fun ensureYBuffer(size: Int): ByteArray {
+        var b = yBuf
+        if (b == null || b.size < size) {
+            b = ByteArray(size)
+            yBuf = b
+        }
+        return b
+    }
+
+    private fun ensureNv21Buffer(size: Int): ByteArray {
+        var b = nv21Buf
+        if (b == null || b.size < size) {
+            b = ByteArray(size)
+            nv21Buf = b
+        }
+        return b
+    }
+
+    private fun ensureDownscaleBuffer(size: Int): ByteArray {
+        var b = downscaleBuf
+        if (b == null || b.size < size) {
+            b = ByteArray(size)
+            downscaleBuf = b
+        }
+        return b
+    }
+
     /**
-     * Downscales a Y plane to the size Rust expects.
+     * Copies the Y plane into the cached [yBuf] and returns the logical size
+     * (which may be less than `yBuf.size` — the buffer is reused as-is).
      *
-     * The HAL delivers ANALYSIS_MAX_SIZE (4096x2160 on this device), because
-     * that is the one YUV size LEVEL_3 guarantees alongside Preview. But the
-     * scanner — Rust and the TFLite models — was written for the sizes in
-     * [targetSize], and a raw 4096x2160 Y-plane (8.8 MB, plus internal
-     * copies) crashes it: a dimension check, an allocation, or the model's
-     * input validation aborts the process outright. So each frame is
-     * downscaled here, on the camera's own thread, before it reaches Rust.
-     *
-     * Nearest-neighbour sampling. The source is 2 to 3 times larger than the
-     * destination and the destination is what the scanner was built for;
-     * averaging would cost CPU for detail a QR code does not reward. QR
-     * modules are high-contrast edges, and sampling preserves those — what
-     * is lost is the sub-pixel detail the scanner's own detector then
-     * resizes away anyway.
-     *
-     * Row padding is honoured on the source side ([srcStride] may be larger
-     * than [srcW]) and not introduced on the destination side: the returned
-     * buffer is tightly packed, so the caller passes `rowStride = dstW`.
+     * The Y plane of a YUV_420_888 ImageProxy has `rowStride` bytes per row
+     * and `height` rows, so the buffer's `remaining()` is usually
+     * `rowStride * height`, not `width * height`. Both are handled: the
+     * caller is told `rowStride` separately and measures the image with it.
      */
-    private fun downscaleGray(
+    private fun copyYPlane(image: ImageProxy): Triple<ByteArray, Int, Int>? {
+        val plane = image.planes[0]
+        val remaining = plane.buffer.remaining()
+        val stride = plane.rowStride
+        val buf = ensureYBuffer(remaining)
+        plane.buffer.get(buf, 0, remaining)
+        return Triple(buf, remaining, stride)
+    }
+
+    /**
+     * Downscales a Y plane into [dst] (nearest-neighbour), honouring the
+     * source row padding. `dst` must be at least `dstW * dstH` bytes.
+     *
+     * Nearest-neighbour rather than averaging: the source is 2 to 3 times
+     * larger than the destination and the destination is what the scanner
+     * was built for; QR modules are high-contrast edges and sampling
+     * preserves them. Averaging would cost CPU for detail the detector
+     * resizes away anyway.
+     */
+    private fun downscaleGrayInto(
         src: ByteArray,
+        dst: ByteArray,
         srcW: Int,
         srcH: Int,
         srcStride: Int,
         dstW: Int,
         dstH: Int,
-    ): ByteArray {
-        // Fast path: same size, no padding. Hand the buffer back untouched.
-        if (srcW == dstW && srcH == dstH && srcStride == srcW) return src
-
-        val dst = ByteArray(dstW * dstH)
+    ) {
         val xRatio = srcW.toFloat() / dstW
         val yRatio = srcH.toFloat() / dstH
         var di = 0
@@ -824,22 +945,71 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 dst[di++] = src[srcRow + sx]
             }
         }
-        return dst
     }
 
-    /// ImageProxy (YUV_420_888) to NV21.
+    /**
+     * Cheap Y-plane statistics for the diagnostic.
+     *
+     * Samples every 64th pixel in each row (col += 64) rather than the whole
+     * plane: a 4096x2160 buffer is 8.8 MB and the point is a min, max and
+     * average rather than a pixel-exact histogram. 1/64 of a natural image
+     * is representative.
+     *
+     * Returns `(min, max, avg)`. `diagFirst16` is set as a side effect: the
+     * first 16 bytes of the buffer, hex-encoded with spaces — the very start
+     * of the Y-plane, which distinguishes "zeroed buffer" (all 00) from
+     * "white frame" (all FF) from "live picture" (mixed).
+     */
+    private fun measureYPlane(
+        y: ByteArray,
+        w: Int,
+        h: Int,
+        stride: Int,
+    ): Triple<Int, Int, Double> {
+        var mn = 255
+        var mx = 0
+        var sum = 0L
+        var count = 0L
+        for (row in 0 until h) {
+            val rowStart = row * stride
+            var col = 0
+            while (col < w) {
+                val idx = rowStart + col
+                if (idx >= y.size) break
+                val v = y[idx].toInt() and 0xFF
+                if (v < mn) mn = v
+                if (v > mx) mx = v
+                sum += v
+                count++
+                col += 64
+            }
+        }
+        val n = minOf(16, y.size)
+        val sb = StringBuilder(n * 3)
+        for (k in 0 until n) {
+            val b = y[k].toInt() and 0xFF
+            if (b < 16) sb.append('0')
+            sb.append(Integer.toHexString(b)).append(' ')
+        }
+        diagFirst16 = sb.toString().trim()
+        val avg = if (count > 0) sum.toDouble() / count.toDouble() else 0.0
+        return Triple(mn, mx, avg)
+    }
+
+    /// ImageProxy (YUV_420_888) to NV21, into the cached [nv21Buf].
     private fun toNv21(image: ImageProxy): ByteArray {
         val w = image.width
         val h = image.height
-        val out = ByteArray(w * h * 3 / 2)
+        val needed = w * h * 3 / 2
+        val out = ensureNv21Buffer(needed)
 
         val yPlane = image.planes[0]
-        val yBuf = yPlane.buffer.duplicate()
+        val yBufLocal = yPlane.buffer.duplicate()
         val yRowStride = yPlane.rowStride
         var pos = 0
         for (row in 0 until h) {
-            yBuf.position(row * yRowStride)
-            yBuf.get(out, pos, w)
+            yBufLocal.position(row * yRowStride)
+            yBufLocal.get(out, pos, w)
             pos += w
         }
 
@@ -883,95 +1053,122 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     // ---------- per frame ----------
     //
-    // Y plane and NV21 copy extracted separately: the scanner only needs Y.
-    // Zero-sized ImageProxy objects are the wake-up bug (counted, kicked,
-    // never sent to Rust). Real frames arrive at ANALYSIS_MAX_SIZE and are
-    // downscaled to [targetSize] before the call into Rust.
+    // In diagnostic mode (SCAN_ENABLED = false) nothing is passed to Rust.
+    // The Y plane is copied into a reused buffer, measured, and surfaced
+    // through debugState. In normal mode the Y plane is downscaled to what
+    // the scanner was built for and handed to submitScan.
     private fun analyze(image: ImageProxy) {
-        if (image.width == 0 || image.height == 0) {
-            emptyFrames++
-            if (emptyFrames == 5L || emptyFrames == 30L || emptyFrames == 120L) {
-                android.util.Log.w(
-                    TAG,
-                    "empty #$emptyFrames: ${image.width}x${image.height} " +
-                    "format=${image.format} — kicking",
-                )
-                main.post { kickAnalysisStream(force = false) }
-            }
-            image.close()
-            return
-        }
-        if (emptyFrames > 0) {
-            android.util.Log.i(TAG, "stream woke after $emptyFrames empty frames")
-            emptyFrames = 0
-        }
-
-        val y: ByteArray
-        val w: Int
-        val h: Int
-        val rowStride: Int
-        val rot: Int
-
         try {
-            val plane = image.planes[0]
-            rowStride = plane.rowStride
-            w = image.width
-            h = image.height
-            rot = image.imageInfo.rotationDegrees
-            y = ByteArray(plane.buffer.remaining())
-            plane.buffer.get(y)
-        } catch (e: Throwable) {
-            android.util.Log.e(TAG, "grab Y err: ${e.message}", e)
-            image.close()
-            return
-        }
-
-        if (scanning) {
-            try {
-                lastNv21 = toNv21(image)
-                lastNv21W = w
-                lastNv21H = h
-                lastNv21Rot = rot
-            } catch (e: Throwable) {
-                android.util.Log.w(
-                    TAG,
-                    "nv21 err (grabFrame disabled): ${e.message} " +
-                    "format=${image.format} planes=${image.planes.size}",
-                )
-                lastNv21 = null
+            if (image.width == 0 || image.height == 0) {
+                emptyFrames++
+                if (emptyFrames == 5L || emptyFrames == 30L || emptyFrames == 120L) {
+                    android.util.Log.w(
+                        TAG,
+                        "empty #$emptyFrames: ${image.width}x${image.height} " +
+                        "format=${image.format} — kicking",
+                    )
+                    main.post { try { kickAnalysisStream(force = false) } catch (_: Throwable) {} }
+                }
+                try { image.close() } catch (_: Throwable) {}
+                return
             }
-        }
+            if (emptyFrames > 0) {
+                android.util.Log.i(TAG, "stream woke after $emptyFrames empty frames")
+                emptyFrames = 0
+            }
 
-        image.close()
+            val w = image.width
+            val h = image.height
+            val rot = image.imageInfo.rotationDegrees
 
-        if (!scanning || !nativeReady || scannerHandle == 0L || busy) {
-            if (skippedFrames++ % 60 == 0L) {
+            // Copy the Y plane into a reused buffer.
+            val copied = copyYPlane(image)
+            if (copied == null) {
+                try { image.close() } catch (_: Throwable) {}
+                return
+            }
+            val (y, yLen, rowStride) = copied
+
+            // Optionally build NV21 for grabFrame. Only when asked — this is
+            // the expensive path and it is not needed on ordinary frames.
+            if (scanning && needNv21) {
+                try {
+                    val nv21 = toNv21(image)
+                    lastNv21 = nv21
+                    lastNv21W = w
+                    lastNv21H = h
+                    lastNv21Rot = rot
+                    needNv21 = false
+                } catch (e: Throwable) {
+                    android.util.Log.w(
+                        TAG,
+                        "nv21 err (grabFrame disabled): ${e.message} " +
+                        "format=${image.format} planes=${image.planes.size}",
+                    )
+                    lastNv21 = null
+                    needNv21 = false
+                }
+            }
+
+            try { image.close() } catch (_: Throwable) {}
+
+            // ---- Measure, always. ----
+            val stats = measureYPlane(y, w, h, rowStride)
+            diagW = w
+            diagH = h
+            diagStride = rowStride
+            diagLen = yLen
+            diagMin = stats.first
+            diagMax = stats.second
+            diagAvg = stats.third
+            diagFramesSeen++
+
+            if (diagFramesSeen <= DIAG_FRAMES) {
                 android.util.Log.i(
                     TAG,
-                    "frame skipped: scanning=$scanning " +
-                    "nativeReady=$nativeReady " +
-                    "scannerHandle=$scannerHandle busy=$busy " +
-                    "format=${image.format} size=${w}x$h",
+                    "diag #$diagFramesSeen: ${w}x$h stride=$rowStride " +
+                    "len=$yLen min=${stats.first} max=${stats.second} " +
+                    "avg=${String.format(Locale.US, "%.1f", stats.third)} " +
+                    "first16=$diagFirst16",
                 )
             }
-            return
-        }
 
-        // Downscale to the size Rust was built for. The HAL delivered
-        // ANALYSIS_MAX_SIZE (guaranteed by LEVEL_3); the scanner is built
-        // for targetSize(shortSide). Doing the conversion here means Rust
-        // never sees 4096x2160 and never aborts on it.
-        val scanTarget = targetSize(shortSide)
-        val yForRust = downscaleGray(
-            y, w, h, rowStride, scanTarget.width, scanTarget.height,
-        )
+            // ---- Diagnostic gate ----
+            if (!SCAN_ENABLED) {
+                analyzedFrames++
+                return
+            }
 
-        analyzedFrames++
-        busy = true
-        try {
-            submitScan(yForRust, scanTarget.width, scanTarget.height, scanTarget.width, rot)
-        } catch (_: java.util.concurrent.RejectedExecutionException) {
-            busy = false
+            if (!scanning || !nativeReady || scannerHandle == 0L || busy) {
+                if (skippedFrames++ % 60 == 0L) {
+                    android.util.Log.i(
+                        TAG,
+                        "frame skipped: scanning=$scanning " +
+                        "nativeReady=$nativeReady " +
+                        "scannerHandle=$scannerHandle busy=$busy " +
+                        "format=${image.format} size=${w}x$h",
+                    )
+                }
+                return
+            }
+
+            val scanTarget = targetSize(shortSide)
+            val dstSize = scanTarget.width * scanTarget.height
+            val dst = ensureDownscaleBuffer(dstSize)
+            downscaleGrayInto(
+                y, dst, w, h, rowStride, scanTarget.width, scanTarget.height,
+            )
+
+            analyzedFrames++
+            busy = true
+            try {
+                submitScan(dst, scanTarget.width, scanTarget.height, scanTarget.width, rot)
+            } catch (_: java.util.concurrent.RejectedExecutionException) {
+                busy = false
+            }
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "analyze failed: ${e.message}", e)
+            try { image.close() } catch (_: Throwable) {}
         }
     }
 
@@ -1003,7 +1200,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     statFrames = 0; statTotalMs = 0; statMaxMs = 0
                 }
 
-                main.post { scanSink?.success(json) }
+                main.post { try { scanSink?.success(json) } catch (_: Throwable) {} }
             } catch (e: Throwable) {
                 android.util.Log.e(TAG, "scan err: ${e.message}")
             } finally {
@@ -1013,31 +1210,35 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     }
 
     private fun teardown() {
-        starting = false
-        orientationListener?.disable()
-        orientationListener = null
-        @Suppress("DEPRECATION")
-        configCallback?.let { activity?.unregisterComponentCallbacks(it) }
-        configCallback = null
-        main.removeCallbacks(rotationCheck)
-        preview = null
-        analysis = null
-        try { cameraProvider?.unbindAll() } catch (_: Throwable) {}
-        cameraProvider = null
-        camera = null
-        try { previewSurface?.release() } catch (_: Throwable) {}
-        previewSurface = null
-        try { textureEntry?.release() } catch (_: Throwable) {}
-        textureEntry = null
-        if (lifecycleRegistry.currentState.isAtLeast(Lifecycle.State.CREATED)) {
-            lifecycleRegistry.currentState = Lifecycle.State.CREATED
+        try {
+            starting = false
+            orientationListener?.disable()
+            orientationListener = null
+            @Suppress("DEPRECATION")
+            configCallback?.let { activity?.unregisterComponentCallbacks(it) }
+            configCallback = null
+            main.removeCallbacks(rotationCheck)
+            preview = null
+            analysis = null
+            try { cameraProvider?.unbindAll() } catch (_: Throwable) {}
+            cameraProvider = null
+            camera = null
+            try { previewSurface?.release() } catch (_: Throwable) {}
+            previewSurface = null
+            try { textureEntry?.release() } catch (_: Throwable) {}
+            textureEntry = null
+            if (lifecycleRegistry.currentState.isAtLeast(Lifecycle.State.CREATED)) {
+                lifecycleRegistry.currentState = Lifecycle.State.CREATED
+            }
+            sessionId = 0L
+            boundShortSide = 0
+            lastNv21 = null
+            emptyFrames = 0
+            lastKickAt = 0
+            kickStrategy = 0
+            releaseScanner()
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "teardown failed", e)
         }
-        sessionId = 0L
-        boundShortSide = 0
-        lastNv21 = null
-        emptyFrames = 0
-        lastKickAt = 0
-        kickStrategy = 0
-        releaseScanner()
     }
 }
