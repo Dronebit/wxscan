@@ -14,6 +14,7 @@ import android.content.res.Configuration
 import android.view.OrientationEventListener
 import android.view.Surface
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.CameraState
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.ImageAnalysis
@@ -33,6 +34,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
+import androidx.lifecycle.Observer
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -47,26 +49,40 @@ import java.util.concurrent.Executors
  * Preview → Flutter SurfaceTexture (GPU, no CPU per frame); ImageAnalysis →
  * Y plane → Rust over JNI.
  *
- * **Bind configuration.** setTargetResolution, setOutputImageFormat(YUV_420_888)
- * and setTargetRotation, applied in one bindToLifecycle — the configuration
- * that first attached the analyser on this Huawei and every variation of
- * which has been worse.
+ * **Bind.** Preview and ImageAnalysis are bound in a single
+ * bindToLifecycle, with setTargetResolution, setOutputImageFormat(YUV_420_888)
+ * and setTargetRotation — the exact combination that works on this Huawei.
+ * No two-step bind, no UseCaseGroup, no ViewPort.
+ *
+ * **Frame gate.** `analyze()` closes the first frames without sending them
+ * to Rust until the camera has actually reached [CameraState.Type.OPEN].
+ * Huawei HALs can deliver one or two malformed frames before the session is
+ * fully configured, and passing those to the decoder seeds it with a frame
+ * whose geometry or bytes are wrong; nothing after that reads correctly,
+ * even when the HAL starts delivering proper frames. The camera's own
+ * state signal is the boundary: OPEN means the session is up.
+ *
+ * **Fallback.** If `CameraState.OPEN` never arrives within
+ * [GATE_FALLBACK_MS], the gate is forced open anyway. A HAL that hangs at
+ * OPENING is worse than a HAL that delivers malformed frames; at least the
+ * scanner gets data. A warning is logged.
+ *
+ * **Auto-rebind.** If no valid frame has been analysed within
+ * [AUTO_REBIND_MS] after the bind, one plain rebind is done. This is the
+ * programmatic equivalent of tapping the resolution chip, which is the
+ * workaround that reliably attaches the analyser on this device. One
+ * rebind, not a chain.
  *
  * **Downscale rule.** Only frames above [MAX_FRAME_PIXELS] are downscaled,
- * and when they are, the aspect ratio is preserved. This matters because
- * Huawei HALs commonly ignore the 16:9 request and deliver a 1:1 frame
- * (1728x1728 for a 1280x720 target); scaling that square to 1280x720 would
- * stretch the QR into a rectangle, the CNN detector would still find the
- * pattern (tolerant), and the decoder would fail to read it (strict) —
- * exactly the "candidates > 0, results = 0" symptom. So a 1728x1728 frame
- * passes through untouched, and only the genuinely oversized buffers
- * (4096x2160 and up) are resized, proportionally, to fit under the cap.
+ * proportionally. Huawei often returns 1728x1728 for a 1280x720 request;
+ * stretching that to 16:9 turns the QR into a rectangle — detector still
+ * finds the pattern (tolerant), decoder cannot read it (strict). So a
+ * 1728x1728 frame passes through untouched, and only the genuinely
+ * oversized buffers (4096x2160 and up) are resized, proportionally.
  *
- * **Format diagnostics.** Every frame refreshes lastImageFormat,
- * lastPlanesCount, lastPixelStride, lastRowStride, lastFrameW, lastFrameH,
- * lastFrameRot. All are surfaced in debugState and shown on the diagnostic
- * panel, so a phone with no adb answers "what did the analyser actually
- * receive".
+ * **Format diagnostics.** lastImageFormat, lastPlanesCount,
+ * lastPixelStride, lastRowStride, lastFrameW, lastFrameH, lastFrameRot,
+ * cameraStateType, cameraIsReady are refreshed and surfaced in debugState.
  *
  * **Buffer caching.** [yBuf], [nv21Buf], [downscaleBuf] are reused.
  *
@@ -94,21 +110,16 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         private const val SCAN_ENABLED = true
         private const val DIAG_FRAMES = 5
 
-        /**
-         * Absolute pixel cap: frames above this are downscaled
-         * (proportionally) before Rust sees them.
-         *
-         * 4 million pixels is roughly 2000x2000. It leaves the 3-million-
-         * pixel 1728x1728 frame a Huawei HAL commonly delivers for a 720p
-         * request untouched, and only downscales the genuinely oversized
-         * buffers — 4096x2160 (8.8M) and above — that crashed the scanner
-         * in earlier tests. Everything below the cap goes to Rust with its
-         * geometry intact.
-         *
-         * Lower this if a crash returns: 2_000_000 is a safer cap, at the
-         * cost of downscaling the 1728x1728 case.
-         */
+        /** Absolute pixel cap; larger frames are downscaled proportionally. */
         private const val MAX_FRAME_PIXELS = 4_000_000L
+
+        /** How long to wait for CameraState.OPEN before forcing the gate
+         *  open regardless. */
+        private const val GATE_FALLBACK_MS = 3000L
+
+        /** How long to wait after bind with no valid analysed frame before
+         *  doing one plain rebind. */
+        private const val AUTO_REBIND_MS = 5000L
     }
 
     @Volatile private var scannerHandle: Long = 0L
@@ -186,6 +197,25 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var firstFrameReceived = false
     @Volatile private var bindCount = 0
 
+    // ---- Frame gate ----
+    /** True once the camera has reached OPEN (or the fallback timer has
+     *  fired). Frames before that are closed without going to Rust. */
+    @Volatile private var cameraIsReady = false
+
+    /** Human-readable last CameraState, for the diagnostic panel. */
+    @Volatile private var cameraStateType = "unknown"
+
+    /** Frames observed while the gate was closed. */
+    @Volatile private var preOpenFrames = 0L
+
+    // CameraState observer, kept so it can be removed on rebind / teardown.
+    private var cameraStateObserver: Observer<CameraState>? = null
+
+    // Gate fallback timer and auto-rebind timer, kept so they can be
+    // cancelled on rebind / teardown.
+    private var gateFallback: Runnable? = null
+    private var autoRebind: Runnable? = null
+
     @Volatile private var diagW = 0
     @Volatile private var diagH = 0
     @Volatile private var diagStride = 0
@@ -196,7 +226,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var diagFirst16 = ""
     @Volatile private var diagFramesSeen = 0L
 
-    // Format diagnostics.
     @Volatile private var lastImageFormat = -1
     @Volatile private var lastPlanesCount = 0
     @Volatile private var lastPixelStride = 0
@@ -250,7 +279,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) { activity = binding.activity }
     override fun onDetachedFromActivity() { activity = null }
 
-    // ---------- EventChannel ----------
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) { scanSink = events }
     override fun onCancel(arguments: Any?) { scanSink = null }
 
@@ -369,6 +397,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "analyzedFrames" to analyzedFrames,
                             "skippedFrames" to skippedFrames,
                             "emptyFrames" to emptyFrames,
+                            "preOpenFrames" to preOpenFrames,
                             "previewW" to previewW,
                             "previewH" to previewH,
                             "bufW" to bufW,
@@ -387,6 +416,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "firstFrameReceived" to firstFrameReceived,
                             "scanEnabled" to SCAN_ENABLED,
                             "maxFramePixels" to MAX_FRAME_PIXELS,
+                            "cameraStateType" to cameraStateType,
+                            "cameraIsReady" to cameraIsReady,
                             "desiredSize" to
                                 "${targetSize(targetShortSide).width}x" +
                                 "${targetSize(targetShortSide).height}",
@@ -462,7 +493,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     ) {
         try {
             releaseScanner()
-
             if (borrowed != 0L) {
                 scannerHandle = try {
                     NativeScanner.retain(borrowed)
@@ -477,7 +507,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     return
                 }
             }
-
             val empty = ByteArray(0)
             val fromPaths = detectPath != null || srPath != null
             scannerHandle = try {
@@ -628,8 +657,17 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
     }
 
+    /**
+     * Single bindToLifecycle of Preview + Analysis. The gate on the first
+     * analysed frame lives in [analyze]; this method only sets up the
+     * camera, subscribes to its state, and arms the two timers (gate
+     * fallback, auto-rebind).
+     */
     private fun bindUseCases(st: SurfaceTexture) {
         val provider = cameraProvider ?: return
+        cancelGateFallback()
+        cancelAutoRebind()
+        unwatchCameraState()
         provider.unbindAll()
         boundShortSide = shortSide
         bindCount++
@@ -679,9 +717,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         android.util.Log.i(
             TAG,
             "bind #$bindCount: single bindToLifecycle(Preview, Analysis) " +
-            "at $desiredSize format=YUV_420_888 " +
-            "(target=$targetShortSide scanEnabled=$SCAN_ENABLED " +
-            "maxFramePixels=$MAX_FRAME_PIXELS)",
+            "at $desiredSize (gate waits for CameraState.OPEN)"
         )
 
         try {
@@ -694,7 +730,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
 
         startOrientationListener()
-
         previewUseCase.resolutionInfo?.resolution?.let {
             bufW = it.width; bufH = it.height
         }
@@ -702,9 +737,18 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             android.util.Log.i(TAG, "analysis resolved to ${it.width}x${it.height}")
         }
         recomputePreviewSize()
-
         emptyFrames = 0
         diagFramesSeen = 0
+        preOpenFrames = 0
+
+        // ---- The gate ----
+        // cameraIsReady starts false. analyze() closes every frame until
+        // either CameraState.OPEN arrives or the fallback timer fires.
+        cameraIsReady = false
+        cameraStateType = "unknown"
+        watchCameraState("bind#$bindCount")
+        armGateFallback()
+        armAutoRebind()
     }
 
     private fun rebindUseCases() {
@@ -714,6 +758,118 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "rebindUseCases failed", e)
         }
+    }
+
+    // ---------- camera state gate ----------
+
+    /**
+     * Subscribes to the camera's state. `OPEN` is the signal: the session
+     * is up and streaming, and only then do we let frames reach Rust.
+     * observeForever, not observe(lifecycleOwner): the registry may be in
+     * CREATED at the moment of subscription, and Lifecycle-based LiveData
+     * does not deliver in that state.
+     */
+    private fun watchCameraState(label: String) {
+        unwatchCameraState()
+        val cam = camera ?: return
+        val observer = object : Observer<CameraState> {
+            override fun onChanged(state: CameraState) {
+                val type = try { state.type.name } catch (_: Throwable) { "?" }
+                cameraStateType = type
+                android.util.Log.i(TAG, "[$label] CameraState: $type")
+                if (state.type == CameraState.Type.OPEN && !cameraIsReady) {
+                    cameraIsReady = true
+                    cancelGateFallback()
+                    android.util.Log.i(
+                        TAG,
+                        "[$label] OPEN — gate opened, frames now reach Rust " +
+                        "(preOpenFrames=$preOpenFrames)"
+                    )
+                }
+            }
+        }
+        cameraStateObserver = observer
+        try {
+            cam.cameraInfo.cameraState.observeForever(observer)
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "[$label] observeForever failed", e)
+            // Fall back to accepting frames immediately; better than a
+            // permanently closed gate.
+            cameraIsReady = true
+        }
+    }
+
+    private fun unwatchCameraState() {
+        cameraStateObserver?.let { obs ->
+            try { camera?.cameraInfo?.cameraState?.removeObserver(obs) } catch (_: Throwable) {}
+        }
+        cameraStateObserver = null
+    }
+
+    /**
+     * Fallback: if `CameraState.OPEN` never arrives, open the gate anyway.
+     * A HAL that hangs at OPENING is worse than one that delivers malformed
+     * frames; at least the scanner gets data. Logged as a warning.
+     */
+    private fun armGateFallback() {
+        cancelGateFallback()
+        val r = Runnable {
+            try {
+                if (!cameraIsReady) {
+                    cameraIsReady = true
+                    android.util.Log.w(
+                        TAG,
+                        "CameraState.OPEN not reached in ${GATE_FALLBACK_MS}ms " +
+                        "(last=$cameraStateType) — forcing gate open"
+                    )
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e(TAG, "gate fallback failed", e)
+            }
+        }
+        gateFallback = r
+        main.postDelayed(r, GATE_FALLBACK_MS)
+    }
+
+    private fun cancelGateFallback() {
+        gateFallback?.let { main.removeCallbacks(it) }
+        gateFallback = null
+    }
+
+    /**
+     * Auto-rebind: if no valid frame has been analysed within
+     * [AUTO_REBIND_MS], do one plain rebind — the programmatic equivalent
+     * of tapping the resolution chip, the workaround that reliably
+     * attaches the analyser on this Huawei. One rebind, not a chain.
+     */
+    private fun armAutoRebind() {
+        cancelAutoRebind()
+        val r = Runnable {
+            try {
+                if (analyzedFrames > 0L) {
+                    android.util.Log.i(TAG, "auto-rebind: frames flowing, no retry needed")
+                    return@Runnable
+                }
+                if (cameraProvider == null) return@Runnable
+                val st = textureEntry?.surfaceTexture() ?: return@Runnable
+                android.util.Log.w(
+                    TAG,
+                    "auto-rebind: no valid frame in ${AUTO_REBIND_MS}ms, " +
+                    "rebinding once (cameraIsReady=$cameraIsReady " +
+                    "state=$cameraStateType preOpen=$preOpenFrames)"
+                )
+                bindUseCases(st)
+            } catch (e: Throwable) {
+                android.util.Log.e(TAG, "auto-rebind failed: ${e.message}")
+            }
+        }
+        autoRebind = r
+        main.postDelayed(r, AUTO_REBIND_MS)
+    }
+
+    private fun cancelAutoRebind() {
+        autoRebind?.let { main.removeCallbacks(it) }
+        autoRebind = null
     }
 
     private fun displayRotation(): Int =
@@ -851,8 +1007,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
         override fun onCancel(arguments: Any?) { sink = null }
     }
-
-    // ---------- cached buffer helpers ----------
 
     private fun ensureYBuffer(size: Int): ByteArray {
         var b = yBuf
@@ -1001,10 +1155,23 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         return out.toByteArray()
     }
 
-    // ---------- per frame ----------
-
     private fun analyze(image: ImageProxy) {
         try {
+            // ---- Gate: camera must have reached OPEN ----
+            if (!cameraIsReady) {
+                preOpenFrames++
+                if (preOpenFrames == 1L || preOpenFrames % 60 == 0L) {
+                    android.util.Log.i(
+                        TAG,
+                        "frame #$preOpenFrames before OPEN " +
+                        "(state=$cameraStateType, " +
+                        "size=${image.width}x${image.height}) — skipped"
+                    )
+                }
+                try { image.close() } catch (_: Throwable) {}
+                return
+            }
+
             val mediaImage = image.image
             if (mediaImage == null) {
                 emptyFrames++
@@ -1012,7 +1179,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.w(
                         TAG,
                         "empty #$emptyFrames: image.image == null " +
-                        "(format=${image.format} planes=${image.planes.size})",
+                        "(format=${image.format} planes=${image.planes.size})"
                     )
                 }
                 try { image.close() } catch (_: Throwable) {}
@@ -1025,7 +1192,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.w(
                         TAG,
                         "empty #$emptyFrames: ${image.width}x${image.height} " +
-                        "format=${image.format} shortSide=$shortSide",
+                        "format=${image.format} shortSide=$shortSide"
                     )
                 }
                 try { image.close() } catch (_: Throwable) {}
@@ -1039,7 +1206,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             if (image.planes.isEmpty()) {
                 android.util.Log.w(
                     TAG,
-                    "planes empty — format=${image.format} size=${image.width}x${image.height}",
+                    "planes empty — format=${image.format} size=${image.width}x${image.height}"
                 )
                 try { image.close() } catch (_: Throwable) {}
                 return
@@ -1049,9 +1216,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 firstFrameReceived = true
                 android.util.Log.i(
                     TAG,
-                    "first frame arrived (${image.width}x${image.height} " +
+                    "first valid frame arrived (${image.width}x${image.height} " +
                     "rot=${image.imageInfo.rotationDegrees}) — " +
-                    "target=$targetShortSide current=$shortSide",
+                    "target=$targetShortSide current=$shortSide " +
+                    "state=$cameraStateType"
                 )
             }
 
@@ -1072,7 +1240,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     "size=${image.width}x${image.height} " +
                     "plane0: rowStride=${p0?.rowStride} " +
                     "pixelStride=${p0?.pixelStride} " +
-                    "bytes=${p0?.buffer?.remaining()}",
+                    "bytes=${p0?.buffer?.remaining()}"
                 )
             }
 
@@ -1099,7 +1267,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.w(
                         TAG,
                         "nv21 err (grabFrame disabled): ${e.message} " +
-                        "format=${image.format} planes=${image.planes.size}",
+                        "format=${image.format} planes=${image.planes.size}"
                     )
                     lastNv21 = null
                     needNv21 = false
@@ -1124,7 +1292,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     "diag #$diagFramesSeen: ${w}x$h stride=$rowStride " +
                     "len=$yLen min=${stats.first} max=${stats.second} " +
                     "avg=${String.format(Locale.US, "%.1f", stats.third)} " +
-                    "first16=$diagFirst16",
+                    "first16=$diagFirst16"
                 )
             }
 
@@ -1140,26 +1308,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         "frame skipped: scanning=$scanning " +
                         "nativeReady=$nativeReady " +
                         "scannerHandle=$scannerHandle busy=$busy " +
-                        "format=${image.format} size=${w}x$h",
+                        "format=${image.format} size=${w}x$h"
                     )
                 }
                 return
             }
 
-            // ---- Downscale rule (proportional, only for genuinely huge frames) ----
-            //
-            // Only frames above MAX_FRAME_PIXELS are resized. Everything else
-            // is handed to Rust untouched, with its aspect ratio intact.
-            //
-            // This matters because Huawei HALs commonly ignore the 16:9
-            // request and deliver a 1:1 frame (1728x1728 for a 1280x720
-            // target). Scaling that square to 1280x720 would stretch the QR
-            // into a rectangle: the CNN detector still finds the pattern
-            // (tolerant) and the decoder cannot read it (strict), which is
-            // the "candidates > 0, results = 0" symptom. Passing 1728x1728
-            // through untouched keeps the QR square, and only the truly
-            // oversized buffers (4096x2160 and up) are resized — again
-            // proportionally, so a square stays a square and 16:9 stays 16:9.
             val framePixels = w.toLong() * h
             if (framePixels > MAX_FRAME_PIXELS) {
                 val scale = Math.sqrt(MAX_FRAME_PIXELS.toDouble() / framePixels.toDouble()).toFloat()
@@ -1167,12 +1321,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 val dstH = (h * scale).toInt().coerceAtLeast(1)
                 val dst = ensureDownscaleBuffer(dstW * dstH)
                 downscaleGrayInto(
-                    y, dst, w, h, rowStride, dstW, dstH,
+                    y, dst, w, h, rowStride, dstW, dstH
                 )
                 android.util.Log.i(
                     TAG,
                     "downscale (proportional): ${w}x$h ($framePixels px) " +
-                    "-> ${dstW}x$dstH (${dstW.toLong() * dstH} px)",
+                    "-> ${dstW}x$dstH (${dstW.toLong() * dstH} px)"
                 )
                 analyzedFrames++
                 busy = true
@@ -1182,8 +1336,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     busy = false
                 }
             } else {
-                // Frame is under the cap — pass through with its real
-                // dimensions and rowStride, aspect ratio intact.
                 analyzedFrames++
                 busy = true
                 try {
@@ -1210,7 +1362,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.i(
                         TAG,
                         "scan #$firstNScans: ${w}x$h rot=$rot stride=$rowStride " +
-                        "yLen=${y.size} dt=${dt}ms json='${json.take(200)}'",
+                        "yLen=${y.size} dt=${dt}ms json='${json.take(200)}'"
                     )
                 }
 
@@ -1237,8 +1389,14 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private fun teardown() {
         try {
+            cancelGateFallback()
+            cancelAutoRebind()
+            unwatchCameraState()
             firstFrameReceived = false
             bindCount = 0
+            cameraIsReady = false
+            cameraStateType = "unknown"
+            preOpenFrames = 0
             starting = false
             orientationListener?.disable()
             orientationListener = null
