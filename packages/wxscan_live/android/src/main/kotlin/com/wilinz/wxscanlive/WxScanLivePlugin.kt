@@ -53,18 +53,19 @@ import java.util.concurrent.Executors
  * setTargetResolution, setOutputImageFormat(YUV_420_888), setTargetRotation.
  *
  * **Gate & Repack.** Frames before CameraState.OPEN are dropped. The Y plane
- * is repacked into a dense (w*h) buffer before Rust, fixing the 0x0 bug.
+ * is repacked into a dense (w*h) buffer before Rust, fixing the 0x0 bug
+ * caused by row padding (rowStride != width).
  *
  * **Throttle.** Submissions to Rust are rate-limited to one every 120 ms
  * (~8 fps), even when Rust is ready. A false candidate can make Rust spend
  * 300–500 ms on one frame; without this cap the next frame is submitted
  * immediately, and the analyser never leaves that state, dropping hundreds
- * of frames and making markers update in bursts. The cap keeps the analyser
- * workload predictable.
+ * of frames and making markers update in bursts.
  *
- * **Downscale.** Frames above MAX_FRAME_PIXELS are scaled proportionally.
- * 1728x1728 (3M px) is downscaled to ~1000x1000 (1M px), which halves the
- * Rust decode time while still providing plenty of pixels for a QR code.
+ * **Downscale.** Handled entirely in Rust (`jni_shim.rs` via
+ * `fast_image_resize`). Kotlin passes the dense buffer as-is. Rust scales
+ * proportionally if the frame exceeds its internal 1M px limit, and returns
+ * the downscaled dimensions in the JSON, which Dart picks up automatically.
  *
  * **Watchdog.** If `busy` stays true for >5 s, it is reset. Protects against
  * a native hang in Rust.
@@ -90,14 +91,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         private const val SCAN_ENABLED = true
         private const val DIAG_FRAMES = 5
-
-        /**
-         * Absolute pixel cap; larger frames are downscaled proportionally.
-         * 1M px is ~1000x1000, which is plenty for a QR code and cuts the
-         * 1728x1728 frame (3M px) down to roughly a third of its original
-         * workload. Rust decode time drops from ~100ms to ~40ms.
-         */
-        private const val MAX_FRAME_PIXELS = 1_000_000L
 
         /**
          * Minimum gap between two submissions to Rust. 120 ms is ~8 fps.
@@ -141,7 +134,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private var yBuf: ByteArray? = null
     private var nv21Buf: ByteArray? = null
-    private var downscaleBuf: ByteArray? = null
     private var repackBuf: ByteArray? = null
 
     @Volatile private var lastNv21: ByteArray? = null
@@ -393,7 +385,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "bindCount" to bindCount,
                             "firstFrameReceived" to firstFrameReceived,
                             "scanEnabled" to SCAN_ENABLED,
-                            "maxFramePixels" to MAX_FRAME_PIXELS,
                             "minSubmitInterval" to MIN_SUBMIT_INTERVAL_MS,
                             "cameraStateType" to cameraStateType,
                             "cameraIsReady" to cameraIsReady,
@@ -402,7 +393,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                                 "${targetSize(targetShortSide).height}",
                             "yBufCached" to (yBuf?.size ?: 0),
                             "nv21BufCached" to (nv21Buf?.size ?: 0),
-                            "downscaleBufCached" to (downscaleBuf?.size ?: 0),
                             "repackBufCached" to (repackBuf?.size ?: 0),
                             "diagW" to diagW,
                             "diagH" to diagH,
@@ -976,15 +966,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         return b
     }
 
-    private fun ensureDownscaleBuffer(size: Int): ByteArray {
-        var b = downscaleBuf
-        if (b == null || b.size != size) {
-            b = ByteArray(size)
-            downscaleBuf = b
-        }
-        return b
-    }
-
     private fun ensureRepackBuffer(size: Int): ByteArray {
         var b = repackBuf
         if (b == null || b.size != size) {
@@ -1001,28 +982,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         val buf = ensureYBuffer(remaining)
         plane.buffer.get(buf, 0, remaining)
         return Triple(buf, remaining, stride)
-    }
-
-    private fun downscaleGrayInto(
-        src: ByteArray,
-        dst: ByteArray,
-        srcW: Int,
-        srcH: Int,
-        srcStride: Int,
-        dstW: Int,
-        dstH: Int,
-    ) {
-        val xRatio = srcW.toFloat() / dstW
-        val yRatio = srcH.toFloat() / dstH
-        var di = 0
-        for (dy in 0 until dstH) {
-            val sy = (dy * yRatio).toInt().coerceAtMost(srcH - 1)
-            val srcRow = sy * srcStride
-            for (dx in 0 until dstW) {
-                val sx = (dx * xRatio).toInt().coerceAtMost(srcW - 1)
-                dst[di++] = src[srcRow + sx]
-            }
-        }
     }
 
     private fun measureYPlane(
@@ -1285,66 +1244,40 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 return
             }
 
-            val framePixels = w.toLong() * h
-            if (framePixels > MAX_FRAME_PIXELS) {
-                val scale = Math.sqrt(MAX_FRAME_PIXELS.toDouble() / framePixels.toDouble()).toFloat()
-                val dstW = (w * scale).toInt().coerceAtLeast(1)
-                val dstH = (h * scale).toInt().coerceAtLeast(1)
-                val dst = ensureDownscaleBuffer(dstW * dstH)
-                downscaleGrayInto(
-                    y, dst, w, h, rowStride, dstW, dstH
-                )
-                android.util.Log.i(
-                    TAG,
-                    "downscale (proportional): ${w}x$h ($framePixels px) " +
-                    "-> ${dstW}x$dstH (${dstW.toLong() * dstH} px)"
-                )
-                analyzedFrames++
-                busyStartedAt = System.currentTimeMillis()
-                lastSubmitAt = System.currentTimeMillis()
-                busy = true
-                try {
-                    submitScan(dst, dstW, dstH, dstW, rot)
-                } catch (e: Throwable) {
-                    android.util.Log.e(TAG, "submitScan failed: ${e.message}", e)
-                    busy = false
-                }
+            val packed: ByteArray
+            val packedStride: Int
+            if (rowStride == w && yLen == w * h) {
+                packed = y
+                packedStride = w
             } else {
-                val packed: ByteArray
-                val packedStride: Int
-                if (rowStride == w && yLen == w * h) {
-                    packed = y
-                    packedStride = w
-                } else {
-                    val needed = w * h
-                    packed = ensureRepackBuffer(needed)
-                    var srcOff = 0
-                    var dstOff = 0
-                    for (row in 0 until h) {
-                        System.arraycopy(y, srcOff, packed, dstOff, w)
-                        srcOff += rowStride
-                        dstOff += w
-                    }
-                    packedStride = w
-                    if (diagFramesSeen <= DIAG_FRAMES) {
-                        android.util.Log.i(
-                            TAG,
-                            "repacked ${w}x$h: yLen=$yLen " +
-                            "(stride=$rowStride, stride*height=${rowStride.toLong() * h}) " +
-                            "-> dense (${needed} bytes)"
-                        )
-                    }
+                val needed = w * h
+                packed = ensureRepackBuffer(needed)
+                var srcOff = 0
+                var dstOff = 0
+                for (row in 0 until h) {
+                    System.arraycopy(y, srcOff, packed, dstOff, w)
+                    srcOff += rowStride
+                    dstOff += w
                 }
-                analyzedFrames++
-                busyStartedAt = System.currentTimeMillis()
-                lastSubmitAt = System.currentTimeMillis()
-                busy = true
-                try {
-                    submitScan(packed, w, h, packedStride, rot)
-                } catch (e: Throwable) {
-                    android.util.Log.e(TAG, "submitScan failed: ${e.message}", e)
-                    busy = false
+                packedStride = w
+                if (diagFramesSeen <= DIAG_FRAMES) {
+                    android.util.Log.i(
+                        TAG,
+                        "repacked ${w}x$h: yLen=$yLen " +
+                        "(stride=$rowStride, stride*height=${rowStride.toLong() * h}) " +
+                        "-> dense (${needed} bytes)"
+                    )
                 }
+            }
+            analyzedFrames++
+            busyStartedAt = System.currentTimeMillis()
+            lastSubmitAt = System.currentTimeMillis()
+            busy = true
+            try {
+                submitScan(packed, w, h, packedStride, rot)
+            } catch (e: Throwable) {
+                android.util.Log.e(TAG, "submitScan failed: ${e.message}", e)
+                busy = false
             }
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "analyze failed: ${e.message}", e)
