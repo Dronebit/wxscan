@@ -11,12 +11,11 @@
 //! Serialization therefore lives here, in the binding layer, rather than in the
 //! C ABI.
 
+use image::imageops::{self, FilterType};
+use image::GrayImage;
 use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
-
-use fast_image_resize::{Image, PixelType, ResizeOptions, Resizer};
-use std::num::NonZeroU32;
 
 use wxscan::frame::upright_gray;
 use wxscan_ffi::WxScanScannerId;
@@ -30,21 +29,22 @@ use wxscan_ffi::WxScanScannerId;
 /// that turns out to be false — which the camera side sees as `busy`, skips
 /// ten frames in a row, and the UI freezes between marker updates.
 ///
-/// 1 million pixels is roughly 1000x1000, which is plenty for a QR code and
-/// cuts the workload by ~3x compared to 1728x1728. Reduce to 640*640 if the
-/// detector inside `scan_upright` turns out to work on 640x640 — that would
-/// make the resize here the only one, with no second pass inside.
+/// 1 million pixels is roughly 1000x1000, plenty for a QR code and ~3x less
+/// work than 1728x1728. Reduce to 640*640 if the detector inside
+/// `scan_upright` turns out to work on 640x640 — that would make the resize
+/// here the only one, with no second pass inside.
 const MAX_INPUT_PIXELS: usize = 1_000_000;
 
 /// Downscales a dense grayscale frame proportionally if it exceeds
 /// [MAX_INPUT_PIXELS].
 ///
-/// Returns the (possibly new) buffer and its dimensions. When the frame is
-/// already small enough, or the buffer happens to be malformed, the input is
-/// returned untouched — an identity that cannot fail, so the caller has no
-/// error path to handle.
+/// Uses `image`'s bilinear filter ([FilterType::Triangle]), which preserves
+/// QR module edges well enough and is fast on ARM. Lanczos3 would be sharper
+/// but noticeably slower; Nearest would be faster but blockier, and a QR code
+/// rewards clean edges.
 ///
-/// On failure inside `fast_image_resize` the buffer comes back empty with
+/// The buffer must be exactly `w * h` bytes — the shape [upright_gray] is
+/// contracted to produce. Anything else comes back as an empty buffer with
 /// zero dimensions, which [scan_json] turns into the empty document. That is
 /// deliberately a "no result" rather than a fallback to the oversized frame:
 /// falling back would re-introduce the freeze this function exists to
@@ -53,31 +53,23 @@ fn maybe_downscale(gray: Vec<u8>, w: usize, h: usize) -> (Vec<u8>, usize, usize)
     if w == 0 || h == 0 {
         return (Vec::new(), 0, 0);
     }
+    if gray.len() != w * h {
+        return (Vec::new(), 0, 0);
+    }
     if w.saturating_mul(h) <= MAX_INPUT_PIXELS {
         return (gray, w, h);
     }
 
     let scale = (MAX_INPUT_PIXELS as f64 / (w * h) as f64).sqrt();
-    let dst_w = ((w as f64 * scale) as u32).max(1);
-    let dst_h = ((h as f64 * scale) as u32).max(1);
+    let dst_w = ((w as f64 * scale).round() as u32).max(1);
+    let dst_h = ((h as f64 * scale).round() as u32).max(1);
 
-    let Some(src_w) = NonZeroU32::new(w as u32) else { return (Vec::new(), 0, 0) };
-    let Some(src_h) = NonZeroU32::new(h as u32) else { return (Vec::new(), 0, 0) };
-    let Some(dst_w_nz) = NonZeroU32::new(dst_w) else { return (Vec::new(), 0, 0) };
-    let Some(dst_h_nz) = NonZeroU32::new(dst_h) else { return (Vec::new(), 0, 0) };
-
-    let Ok(src_image) = Image::from_vec_u8(src_w, src_h, gray, PixelType::U8) else {
-        return (Vec::new(), 0, 0);
+    let img: GrayImage = match image::ImageBuffer::from_raw(w as u32, h as u32, gray) {
+        Some(img) => img,
+        None => return (Vec::new(), 0, 0),
     };
-    let mut dst_image = Image::new(dst_w_nz, dst_h_nz, PixelType::U8);
-    let mut resizer = Resizer::new();
-    if resizer
-        .resize(&src_image, &mut dst_image, &ResizeOptions::new())
-        .is_err()
-    {
-        return (Vec::new(), 0, 0);
-    }
-    (dst_image.into_vec(), dst_w as usize, dst_h as usize)
+    let resized = imageops::resize(&img, dst_w, dst_h, FilterType::Triangle);
+    (resized.into_raw(), dst_w as usize, dst_h as usize)
 }
 
 /// A `jlong` as a handle, or 0 if it cannot be one.
@@ -117,7 +109,7 @@ pub extern "system" fn Java_com_wilinz_wxscanlive_core_NativeScanner_nativeCreat
     // A copy that fails leaves a Java exception pending, and this side answers
     // with the mode without models rather than propagating one — so the
     // throwable has to go, or it surfaces at some unrelated JNI call later.
-    let mut read = |env: &mut JNIEnv, a: &JByteArray| -> Vec<u8> {
+    let read = |env: &mut JNIEnv, a: &JByteArray| -> Vec<u8> {
         match env.convert_byte_array(a) {
             Ok(v) => v,
             Err(_) => {
@@ -164,7 +156,7 @@ pub extern "system" fn Java_com_wilinz_wxscanlive_core_NativeScanner_nativeCreat
     // A path that will not come across is treated as absent rather than
     // propagated: the throwable has to go either way, or it surfaces at some
     // unrelated JNI call later.
-    let mut read = |env: &mut JNIEnv, p: &JString| -> Option<std::ffi::CString> {
+    let read = |env: &mut JNIEnv, p: &JString| -> Option<std::ffi::CString> {
         if p.is_null() {
             return None;
         }
@@ -351,8 +343,8 @@ fn scan_json(
     // This is the only scaling the scanner performs on the camera path; on
     // Huawei the HAL ignores the 16:9 request and delivers 1:1 frames, and a
     // raw 1728x1728 (3M px) is both slow (100–500 ms per frame) and needless
-    // for a QR code. The JSON below reports the downscaled dimensions, so
-    // the caller's geometry matches what the detector actually saw.
+    // for a QR code. The JSON below reports the downscaled dimensions, so the
+    // caller's geometry matches what the detector actually saw.
     let (gray, ow, oh) = maybe_downscale(gray, ow, oh);
     if ow == 0 || oh == 0 || gray.len() < ow * oh {
         return empty_json();
