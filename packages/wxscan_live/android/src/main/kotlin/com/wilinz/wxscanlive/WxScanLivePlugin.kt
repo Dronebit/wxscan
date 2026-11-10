@@ -9,25 +9,17 @@ import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
 import android.os.Handler
 import android.os.Looper
-import android.util.Rational
 import android.util.Size
 import android.content.res.Configuration
 import android.view.OrientationEventListener
 import android.view.Surface
-import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.CameraState
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceRequest
-import androidx.camera.core.UseCaseGroup
-import androidx.camera.core.ViewPort
-import androidx.camera.core.resolutionselector.AspectRatioStrategy
-import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
@@ -41,7 +33,6 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
-import androidx.lifecycle.Observer
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -53,57 +44,52 @@ import java.util.Locale
 import java.util.concurrent.Executors
 
 /**
- * Preview goes through CameraX into a Flutter SurfaceTexture (GPU, no CPU
- * per frame); ImageAnalysis sends the Y plane straight to Rust over JNI.
+ * Preview → Flutter SurfaceTexture (GPU, no CPU per frame); ImageAnalysis →
+ * Y plane → Rust over JNI.
  *
- * **The Huawei bind bug, and why this version waits on CameraState.**
+ * **This version follows the official CameraX QR-scanner sample as closely
+ * as the Y-plane-to-Rust path allows.** Previous iterations added
+ * ResolutionSelector + AspectRatioStrategy, UseCaseGroup + ViewPort,
+ * CameraState.OPEN waits, two-step binds, warm/cold distinction, kick loops,
+ * retry chains — all of it in an attempt to wake the analyser on Huawei.
+ * The official sample has none of that: it binds Preview and ImageAnalysis
+ * in one bindToLifecycle call with default settings, and it works. So this
+ * file does the same and treats the Huawei issue, if it reappears, as a
+ * fresh question rather than as something to pre-empt with machinery.
  *
- * On STG-LX2 / P Smart 5G (EMUI 12, Android 12), the analysis stream is
- * silent (zero-sized ImageProxy or no frames at all) unless the analyser
- * attaches in a particular way. The previous iterations of this file tried
- * several ways to hit that way, all of them on fixed timers:
+ * What is taken from the sample verbatim:
  *
- *   * two-step bind after 800 ms (cold),
- *   * a second plain bind after 500 ms (warm),
- *   * a rebind chain that cycled through sizes,
- *   * zoom kicks, AF kicks, torch blips.
+ *  * `Preview.Builder().build()` — no resolution, no rotation, no format.
+ *  * `ImageAnalysis.Builder().setBackpressureStrategy(STRATEGY_KEEP_ONLY_LATEST).build()`
+ *    — same, nothing else.
+ *  * One `bindToLifecycle(lifecycle, selector, preview, analysis)`.
+ *  * `CameraSelector.Builder().requireLensFacing(LENS_FACING_BACK).build()`.
+ *  * `imageProxy.image` is inspected before anything else: null means the
+ *    frame is not a YUV Image at all, and is closed and dropped.
  *
- * Timers are the wrong tool. `bindToLifecycle` returns a [Camera] immediately,
- * but the underlying Camera2 session is created asynchronously — the state
- * goes PENDING_OPEN → OPENING → OPEN, and only when it reaches OPEN are the
- * surfaces actually attached and streaming. A rebind scheduled 500 ms after
- * the previous one may arrive before the previous session finished opening,
- * and CameraX cancels the earlier one — producing exactly the 0x0 frame
- * state this file has been fighting.
+ * What is added, because Rust needs a Y plane and the sample's MLKit path
+ * does not:
  *
- * So the bind sequence is now driven by [CameraState] instead:
+ *  * A Y-plane copy into a reused buffer, with row padding honoured.
+ *  * `setTargetResolution(Size)` on both use cases — deprecated, but the
+ *    only size control the sample's API surface offers, and what switches
+ *    between 720p / 1080p / Max from Dart.
+ *  * Downscale only if the HAL ignores the target and hands back something
+ *    much bigger.
  *
- *   1. bindToLifecycle(Preview alone).
- *   2. Wait for cameraState.type == OPEN, plus 300 ms of settling.
- *   3. bindToLifecycle(UseCaseGroup(Preview, Analysis, shared ViewPort)).
- *   4. Wait for cameraState.type == OPEN again.
- *   5. Wait for frames.
+ * `setResolution` re-binds with a new `setTargetResolution`. There is no
+ * warm/cold distinction: every bind is the sample's single-step bind, and
+ * if it fails the only thing that follows is a log line, not a retry loop.
  *
- * Every bind — first open, resolution change, manual kick — goes through
- * this same sequence. There is no "warm" shortcut and no retry loop: the
- * sequence itself is the retry, because each step waits until the camera
- * is genuinely ready before doing the next thing.
+ * `kickStream` from the diagnostic panel does a plain `unbindAll` +
+ * `bindToLifecycle` of the same use cases — the same operation the sample
+ * performs on `openCamera()`, and the one the user found working by hand
+ * when re-setting the resolution.
  *
- * A timeout of 3 s on each "wait for OPEN" covers the case where
- * CameraState never reaches OPEN (Huawei HALs have been known to hold the
- * state at OPENING forever). On timeout, the step proceeds anyway, so a
- * broken CameraState does not deadlock the sequence.
+ * **Buffer caching.** [yBuf], [nv21Buf], [downscaleBuf] are reused.
  *
- * The single remaining async step is a manual `kickStream` from the
- * diagnostic panel, which just restarts the sequence from the top.
- *
- * **setOutputImageRotationEnabled(false).** Explicit, so the ImageProxy is
- * in the sensor's orientation with the rotation in imageInfo.rotationDegrees.
- *
- * **Everything else as before.** Shared AspectRatioStrategy, same target
- * size for both use cases, FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
- * SCAN_ENABLED gate, downscale only if the HAL hands back something much
- * bigger, cached Y/NV21/downscale buffers, try-catch(Throwable) everywhere.
+ * **try-catch(Throwable)** on every entry point. Does not catch a Rust
+ * SIGABRT — nothing in Kotlin can.
  */
 class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     EventChannel.StreamHandler, ActivityAware, LifecycleOwner {
@@ -127,14 +113,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         private const val SCAN_ENABLED = true
         private const val DIAG_FRAMES = 5
         private const val DOWNSCALE_THRESHOLD = 2
-
-        /** Delay between "cameraState OPEN" and the next bind step. The
-         *  session is streaming by then; this is the cushion the HAL needs
-         *  to accept a second bindToLifecycle without cancelling the first. */
-        private const val OPEN_SETTLE_MS = 300L
-
-        /** How long "wait for OPEN" may run before proceeding anyway. */
-        private const val OPEN_TIMEOUT_MS = 3000L
     }
 
     @Volatile private var scannerHandle: Long = 0L
@@ -209,20 +187,9 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var emptyFrames = 0L
     @Volatile private var firstNScans = 0
 
-    // Bind state.
-    /** True once any frame has arrived for the current bind cycle. Reset by
-     *  setResolution / kickStream. */
     @Volatile private var firstFrameReceived = false
-    /** 0 = idle, 1 = Preview-only step done, 2 = UseCaseGroup step done. */
-    @Volatile private var bindStage = 0
     @Volatile private var bindCount = 0
-    /** Tasks scheduled for the current bind, cancelled on rebind / teardown. */
-    private var pendingBinds: MutableList<Runnable> = mutableListOf()
 
-    // CameraState waiting.
-    private var currentWaiter: CameraOpenWaiter? = null
-
-    // Diagnostic: last measured Y-plane stats.
     @Volatile private var diagW = 0
     @Volatile private var diagH = 0
     @Volatile private var diagStride = 0
@@ -304,14 +271,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     val want = call.argument<Int>("shortSide") ?: ANALYSIS_HEIGHT
                     if (cameraProvider == null) {
                         targetShortSide = want
+                        shortSide = want
                         result.success(null)
                     } else {
                         main.post {
                             try {
-                                android.util.Log.i(
-                                    TAG,
-                                    "setResolution($want): full two-step bind",
-                                )
+                                android.util.Log.i(TAG, "setResolution($want): rebind")
                                 targetShortSide = want
                                 shortSide = want
                                 firstFrameReceived = false
@@ -377,12 +342,13 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         )
                     )
                 }
-                // Manual restart of the whole bind sequence. Useful when a
-                // session has gone silent for any reason.
+                // Manual rebind, same operation the sample's openCamera()
+                // performs on every open. Useful when a session has gone
+                // silent.
                 "kickStream" -> {
                     main.post {
                         try {
-                            android.util.Log.i(TAG, "manual restart of bind sequence")
+                            android.util.Log.i(TAG, "manual rebind (kickStream)")
                             firstFrameReceived = false
                             shortSide = targetShortSide
                             rebindUseCases()
@@ -416,7 +382,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "hasPreview" to (preview != null),
                             "lastNv21" to (lastNv21?.size ?: 0),
                             "bindCount" to bindCount,
-                            "bindStage" to bindStage,
                             "firstFrameReceived" to firstFrameReceived,
                             "scanEnabled" to SCAN_ENABLED,
                             "desiredSize" to
@@ -614,7 +579,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             }
             bindCount = 0
             firstFrameReceived = false
-            bindStage = 0
 
             ensureScanner(detect, sr, detectPath, srPath, borrowed)
             starting = true
@@ -655,58 +619,26 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     }
 
     /**
-     * Two-step bind, driven by CameraState.OPEN.
-     *
-     * Step 1: Preview alone. Wait for OPEN.
-     * Step 2: UseCaseGroup(Preview, Analysis, ViewPort). Wait for OPEN.
-     *
-     * Every entry into this method — first open, resolution change, manual
-     * kick — runs this same sequence. There is no warm/cold distinction and
-     * no retry chain; the sequence waits for the camera to be genuinely
-     * ready between steps, which is the only reliable signal on this device.
+     * Binds Preview and ImageAnalysis in a single bindToLifecycle, the way
+     * the official CameraX QR-scanner sample does. The only additions are
+     * setTargetResolution (deprecated, but the only size control the sample
+     * path offers) and the surface-provider callback that copies the Y
+     * plane into [st] for Rust.
      */
     private fun bindUseCases(st: SurfaceTexture) {
         val provider = cameraProvider ?: return
-        cancelPendingBinds()
-        cancelCameraOpenWait()
         provider.unbindAll()
         boundShortSide = shortSide
         bindCount++
 
-        val selector = CameraSelector.DEFAULT_BACK_CAMERA
         val desiredSize = targetSize(shortSide)
 
-        val aspectRatioStrategy = AspectRatioStrategy(
-            AspectRatio.RATIO_16_9,
-            AspectRatioStrategy.FALLBACK_RULE_AUTO,
-        )
-
-        val previewResolutionSelector = ResolutionSelector.Builder()
-            .setAspectRatioStrategy(aspectRatioStrategy)
-            .setResolutionStrategy(
-                ResolutionStrategy(
-                    desiredSize,
-                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
-                )
-            )
+        val selector = CameraSelector.Builder()
+            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
             .build()
-
-        val analysisResolutionSelector = ResolutionSelector.Builder()
-            .setAspectRatioStrategy(aspectRatioStrategy)
-            .setResolutionStrategy(
-                ResolutionStrategy(
-                    desiredSize,
-                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
-                )
-            )
-            .build()
-
-        lastTargetRotation = uiRotation()
-        displayRotationDegrees = rotationDegrees(lastTargetRotation)
 
         val previewUseCase = Preview.Builder()
-            .setResolutionSelector(previewResolutionSelector)
-            .setTargetRotation(Surface.ROTATION_0)
+            .setTargetResolution(desiredSize)
             .build()
         previewUseCase.setSurfaceProvider { request: SurfaceRequest ->
             try {
@@ -714,7 +646,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 android.util.Log.i(
                     TAG,
                     "surface request ${res.width}x${res.height} " +
-                    "(current buf=${bufW}x$bufH)",
+                    "(current buf=${bufW}x$bufH)"
                 )
                 st.setDefaultBufferSize(res.width, res.height)
                 bufW = res.width
@@ -732,201 +664,39 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         preview = previewUseCase
 
         val analysisUseCase = ImageAnalysis.Builder()
-            .setResolutionSelector(analysisResolutionSelector)
-            .setTargetRotation(lastTargetRotation)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+            .setTargetResolution(desiredSize)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageRotationEnabled(false)
             .build()
         analysisUseCase.setAnalyzer(camExec, ::analyze)
         analysis = analysisUseCase
 
-        // ---- Step 1: Preview only ----
-        bindStage = 1
         android.util.Log.i(
             TAG,
-            "bind #$bindCount step-1: Preview-only at $desiredSize " +
-            "(target=$targetShortSide scanEnabled=$SCAN_ENABLED)",
+            "bind #$bindCount: single bindToLifecycle(Preview, Analysis) " +
+            "at $desiredSize (target=$targetShortSide scanEnabled=$SCAN_ENABLED)",
         )
-        camera = provider.bindToLifecycle(this, selector, previewUseCase)
+
+        try {
+            camera = provider.bindToLifecycle(
+                this, selector, previewUseCase, analysisUseCase
+            )
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "bindToLifecycle failed", e)
+            return
+        }
+
         startOrientationListener()
 
         previewUseCase.resolutionInfo?.resolution?.let {
             bufW = it.width; bufH = it.height
         }
+        analysisUseCase.resolutionInfo?.resolution?.let {
+            android.util.Log.i(TAG, "analysis resolved to ${it.width}x${it.height}")
+        }
         recomputePreviewSize()
 
         emptyFrames = 0
         diagFramesSeen = 0
-
-        // ---- Wait for OPEN, then step 2 ----
-        waitForCameraOpen("bind#$bindCount-step1") {
-            try {
-                if (firstFrameReceived) {
-                    android.util.Log.i(
-                        TAG,
-                        "bind #$bindCount step-2 skipped: frame already received",
-                    )
-                    bindStage = 0
-                    return@waitForCameraOpen
-                }
-                if (cameraProvider == null || textureEntry == null) {
-                    android.util.Log.w(
-                        TAG,
-                        "bind #$bindCount step-2 skipped: provider or entry gone",
-                    )
-                    bindStage = 0
-                    return@waitForCameraOpen
-                }
-                val viewPort = ViewPort.Builder(
-                    Rational(16, 9),
-                    lastTargetRotation,
-                ).build()
-                val group = UseCaseGroup.Builder()
-                    .addUseCase(previewUseCase)
-                    .addUseCase(analysisUseCase)
-                    .setViewPort(viewPort)
-                    .build()
-                bindStage = 2
-                android.util.Log.i(
-                    TAG,
-                    "bind #$bindCount step-2: UseCaseGroup at $desiredSize " +
-                    "(viewPort=16:9 rot=$lastTargetRotation)",
-                )
-                camera = provider.bindToLifecycle(this, selector, group)
-                analysisUseCase.resolutionInfo?.resolution?.let {
-                    android.util.Log.i(
-                        TAG,
-                        "bind #$bindCount analysis resolved to ${it.width}x${it.height}",
-                    )
-                }
-
-                waitForCameraOpen("bind#$bindCount-step2") {
-                    bindStage = 0
-                    android.util.Log.i(
-                        TAG,
-                        "bind #$bindCount complete, waiting for frames",
-                    )
-                }
-            } catch (e: Throwable) {
-                android.util.Log.e(TAG, "bind #$bindCount step-2 failed", e)
-                bindStage = 0
-            }
-        }
-
-        focusAt(0.5, 0.5)
-    }
-
-    // ---------- CameraState waiting ----------
-
-    /**
-     * A pending CameraState observer, with the timeout that will fire if
-     * OPEN never arrives. Held so the sequence can be cancelled cleanly
-     * when a rebind or teardown comes in mid-wait.
-     */
-    private class CameraOpenWaiter(
-        val observer: Observer<CameraState>,
-        val timeout: Runnable,
-        val camera: Camera,
-    )
-
-    /**
-     * Waits for [Camera] to reach [CameraState.Type.OPEN], then schedules
-     * [onOpen] after [OPEN_SETTLE_MS]. If OPEN has not been seen within
-     * [OPEN_TIMEOUT_MS], [onOpen] runs anyway — a stuck CameraState is
-     * worse than a bind that fires a little early.
-     *
-     * Every call cancels the previous pending wait: only one wait can be
-     * outstanding at a time, which is exactly the sequence's structure
-     * (step-1 wait, then step-2 wait, never both).
-     */
-    private fun waitForCameraOpen(
-        label: String,
-        onOpen: () -> Unit,
-    ) {
-        cancelCameraOpenWait()
-        val cam = camera
-        if (cam == null) {
-            android.util.Log.w(TAG, "[$label] no camera reference, waiting 500ms")
-            val r = Runnable {
-                if (!firstFrameReceived) onOpen()
-            }
-            pendingBinds.add(r)
-            main.postDelayed(r, 500L)
-            return
-        }
-
-        var fired = false
-
-        val observer = object : Observer<CameraState> {
-            override fun onChanged(state: CameraState) {
-                if (fired) return
-                if (state.type == CameraState.Type.OPEN) {
-                    fired = true
-                    android.util.Log.i(TAG, "[$label] state=OPEN")
-                    try {
-                        cam.cameraInfo.cameraState.removeObserver(this)
-                    } catch (_: Throwable) {}
-                    clearWaiterField()
-                    val r = Runnable {
-                        if (!firstFrameReceived) onOpen()
-                    }
-                    pendingBinds.add(r)
-                    main.postDelayed(r, OPEN_SETTLE_MS)
-                }
-            }
-        }
-
-        val timeout = Runnable {
-            if (fired) return@Runnable
-            fired = true
-            android.util.Log.w(
-                TAG,
-                "[$label] OPEN not reached in ${OPEN_TIMEOUT_MS}ms; proceeding anyway",
-            )
-            try {
-                cam.cameraInfo.cameraState.removeObserver(observer)
-            } catch (_: Throwable) {}
-            clearWaiterField()
-            val r = Runnable {
-                if (!firstFrameReceived) onOpen()
-            }
-            pendingBinds.add(r)
-            main.postDelayed(r, OPEN_SETTLE_MS)
-        }
-
-        try {
-            cam.cameraInfo.cameraState.observeForever(observer)
-        } catch (e: Throwable) {
-            android.util.Log.e(TAG, "[$label] observeForever failed: ${e.message}", e)
-            val r = Runnable {
-                if (!firstFrameReceived) onOpen()
-            }
-            pendingBinds.add(r)
-            main.postDelayed(r, 500L)
-            return
-        }
-
-        currentWaiter = CameraOpenWaiter(observer, timeout, cam)
-        main.postDelayed(timeout, OPEN_TIMEOUT_MS)
-    }
-
-    private fun clearWaiterField() {
-        currentWaiter = null
-    }
-
-    private fun cancelCameraOpenWait() {
-        val w = currentWaiter ?: return
-        currentWaiter = null
-        try {
-            w.camera.cameraInfo.cameraState.removeObserver(w.observer)
-        } catch (_: Throwable) {}
-        main.removeCallbacks(w.timeout)
-    }
-
-    private fun cancelPendingBinds() {
-        for (r in pendingBinds) main.removeCallbacks(r)
-        pendingBinds.clear()
     }
 
     private fun rebindUseCases() {
@@ -1227,13 +997,29 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private fun analyze(image: ImageProxy) {
         try {
+            // Same guard as the official sample: image is the ImageProxy's
+            // Image, and it is null when the format cannot carry pixels.
+            val mediaImage = image.image
+            if (mediaImage == null) {
+                emptyFrames++
+                if (emptyFrames == 5L || emptyFrames == 30L || emptyFrames == 120L) {
+                    android.util.Log.w(
+                        TAG,
+                        "empty #$emptyFrames: image.image == null " +
+                        "(format=${image.format} planes=${image.planes.size})",
+                    )
+                }
+                try { image.close() } catch (_: Throwable) {}
+                return
+            }
+
             if (image.width == 0 || image.height == 0) {
                 emptyFrames++
                 if (emptyFrames == 5L || emptyFrames == 30L || emptyFrames == 120L) {
                     android.util.Log.w(
                         TAG,
                         "empty #$emptyFrames: ${image.width}x${image.height} " +
-                        "format=${image.format} shortSide=$shortSide bindStage=$bindStage",
+                        "format=${image.format} shortSide=$shortSide",
                     )
                 }
                 try { image.close() } catch (_: Throwable) {}
@@ -1244,13 +1030,22 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 emptyFrames = 0
             }
 
+            if (image.planes.isEmpty()) {
+                android.util.Log.w(
+                    TAG,
+                    "planes empty — format=${image.format} size=${image.width}x${image.height}",
+                )
+                try { image.close() } catch (_: Throwable) {}
+                return
+            }
+
             if (!firstFrameReceived) {
                 firstFrameReceived = true
                 android.util.Log.i(
                     TAG,
                     "first frame arrived (${image.width}x${image.height} " +
                     "rot=${image.imageInfo.rotationDegrees}) — " +
-                    "target=$targetShortSide current=$shortSide bindStage=$bindStage",
+                    "target=$targetShortSide current=$shortSide",
                 )
             }
 
@@ -1400,10 +1195,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private fun teardown() {
         try {
-            cancelCameraOpenWait()
-            cancelPendingBinds()
             firstFrameReceived = false
-            bindStage = 0
             bindCount = 0
             starting = false
             orientationListener?.disable()
