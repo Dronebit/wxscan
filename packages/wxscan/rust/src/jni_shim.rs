@@ -15,8 +15,70 @@ use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
 
+use fast_image_resize::{Image, PixelType, ResizeOptions, Resizer};
+use std::num::NonZeroU32;
+
 use wxscan::frame::upright_gray;
 use wxscan_ffi::WxScanScannerId;
+
+/// Frames above this many pixels are downscaled proportionally before
+/// detection.
+///
+/// Huawei HALs commonly ignore the 16:9 request and deliver a 1:1 frame
+/// (1728x1728 for a 1280x720 target). Passing that through costs ~100 ms
+/// per frame in the CNN, and ~300–500 ms when the detector finds a candidate
+/// that turns out to be false — which the camera side sees as `busy`, skips
+/// ten frames in a row, and the UI freezes between marker updates.
+///
+/// 1 million pixels is roughly 1000x1000, which is plenty for a QR code and
+/// cuts the workload by ~3x compared to 1728x1728. Reduce to 640*640 if the
+/// detector inside `scan_upright` turns out to work on 640x640 — that would
+/// make the resize here the only one, with no second pass inside.
+const MAX_INPUT_PIXELS: usize = 1_000_000;
+
+/// Downscales a dense grayscale frame proportionally if it exceeds
+/// [MAX_INPUT_PIXELS].
+///
+/// Returns the (possibly new) buffer and its dimensions. When the frame is
+/// already small enough, or the buffer happens to be malformed, the input is
+/// returned untouched — an identity that cannot fail, so the caller has no
+/// error path to handle.
+///
+/// On failure inside `fast_image_resize` the buffer comes back empty with
+/// zero dimensions, which [scan_json] turns into the empty document. That is
+/// deliberately a "no result" rather than a fallback to the oversized frame:
+/// falling back would re-introduce the freeze this function exists to
+/// prevent.
+fn maybe_downscale(gray: Vec<u8>, w: usize, h: usize) -> (Vec<u8>, usize, usize) {
+    if w == 0 || h == 0 {
+        return (Vec::new(), 0, 0);
+    }
+    if w.saturating_mul(h) <= MAX_INPUT_PIXELS {
+        return (gray, w, h);
+    }
+
+    let scale = (MAX_INPUT_PIXELS as f64 / (w * h) as f64).sqrt();
+    let dst_w = ((w as f64 * scale) as u32).max(1);
+    let dst_h = ((h as f64 * scale) as u32).max(1);
+
+    let Some(src_w) = NonZeroU32::new(w as u32) else { return (Vec::new(), 0, 0) };
+    let Some(src_h) = NonZeroU32::new(h as u32) else { return (Vec::new(), 0, 0) };
+    let Some(dst_w_nz) = NonZeroU32::new(dst_w) else { return (Vec::new(), 0, 0) };
+    let Some(dst_h_nz) = NonZeroU32::new(dst_h) else { return (Vec::new(), 0, 0) };
+
+    let Ok(src_image) = Image::from_vec_u8(src_w, src_h, gray, PixelType::U8) else {
+        return (Vec::new(), 0, 0);
+    };
+    let mut dst_image = Image::new(dst_w_nz, dst_h_nz, PixelType::U8);
+    let mut resizer = Resizer::new();
+    if resizer
+        .resize(&src_image, &mut dst_image, &ResizeOptions::new())
+        .is_err()
+    {
+        return (Vec::new(), 0, 0);
+    }
+    (dst_image.into_vec(), dst_w as usize, dst_h as usize)
+}
 
 /// A `jlong` as a handle, or 0 if it cannot be one.
 ///
@@ -245,6 +307,12 @@ pub extern "system" fn Java_com_wilinz_wxscanlive_core_NativeScanner_nativePing(
 ///
 /// A handle that names no scanner yields the empty document, as does a frame
 /// whose dimensions do not match its buffer.
+///
+/// The reported `w` and `h` are the dimensions **after** any downscale — the
+/// detector and decoder work in those coordinates, so the caller's markers
+/// and hit-testing agree with them without any extra scaling on the caller's
+/// side. Downscaling happens only when the input exceeds [MAX_INPUT_PIXELS];
+/// see [maybe_downscale].
 fn scan_json(
     handle: WxScanScannerId,
     bytes: &[u8],
@@ -274,7 +342,22 @@ fn scan_json(
         return empty_json();
     }
 
+    // upright_gray does rotation, packing (removes row padding) and, on
+    // rotated frames, dimension swap. Its output is dense: `ow * oh` bytes,
+    // one per pixel.
     let (gray, ow, oh) = upright_gray(bytes, w, h, stride, rotation);
+
+    // Downscale if the resulting dense frame is bigger than MAX_INPUT_PIXELS.
+    // This is the only scaling the scanner performs on the camera path; on
+    // Huawei the HAL ignores the 16:9 request and delivers 1:1 frames, and a
+    // raw 1728x1728 (3M px) is both slow (100–500 ms per frame) and needless
+    // for a QR code. The JSON below reports the downscaled dimensions, so
+    // the caller's geometry matches what the detector actually saw.
+    let (gray, ow, oh) = maybe_downscale(gray, ow, oh);
+    if ow == 0 || oh == 0 || gray.len() < ow * oh {
+        return empty_json();
+    }
+
     let (results, candidates) = scanner.scan_upright(&gray, ow, oh);
 
     let flip = |x: f32| if mirror { ow as f32 - x } else { x };
