@@ -47,29 +47,22 @@ import java.util.concurrent.Executors
  * Preview → Flutter SurfaceTexture (GPU, no CPU per frame); ImageAnalysis →
  * Y plane → Rust over JNI.
  *
- * **First bind is google-style.** No setTargetResolution, no
- * setOutputImageFormat, no setTargetRotation on the first
- * bindToLifecycle. CameraX is left to choose, exactly as the official
- * CameraX QR-scanner sample does. This is the request the Huawei HAL is
- * written for. `setResolution` rebinds with an explicit
- * setTargetResolution, so switching 720p/1080p from Dart is still
- * available when wanted.
+ * **Bind configuration.** This is the configuration that works on this
+ * Huawei: setTargetResolution, setOutputImageFormat(YUV_420_888) and
+ * setTargetRotation, applied in one bindToLifecycle. Every previous
+ * variation that removed one of those three produced 0x0 frames or a
+ * silent analyser. They are all three back, exactly as they were in the
+ * build that first attached the analyser on the very first open.
  *
- * **Frame diagnostics.** Every frame refreshes [lastImageFormat],
+ * **Format diagnostics.** Every frame refreshes [lastImageFormat],
  * [lastPlanesCount], [lastPixelStride], [lastRowStride], [lastFrameW],
  * [lastFrameH], [lastFrameRot]. All are surfaced in [debugState] and
- * rendered on the diagnostic panel, so a phone with no computer attached
- * answers "what did the analyser actually receive":
+ * rendered on the diagnostic panel:
  *
  *   format 35, planes 3, pixelStride 1  → YUV_420_888, correct
- *   format 1,  planes 1, pixelStride 4  → RGBA_8888, WRONG (Rust reads
- *                                          every fourth byte as Y)
- *   format 17, planes 1, pixelStride 1  → NV21, wrong for Y-plane reading
+ *   format 1,  planes 1, pixelStride 4  → RGBA_8888, wrong
+ *   format 17, planes 1, pixelStride 1  → NV21, wrong
  *   format 256, planes 1, pixelStride 1 → JPEG, wrong
- *
- * That matters because this file reads planes[0] as a grayscale Y plane.
- * RGBA leaves the detector something QR-shaped it can still find, and the
- * decoder unable to read it — the "candidates > 0, results = 0" symptom.
  *
  * **Buffer caching.** [yBuf], [nv21Buf], [downscaleBuf] are reused.
  *
@@ -147,8 +140,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var shortSide = ANALYSIS_HEIGHT
     @Volatile private var targetShortSide = ANALYSIS_HEIGHT
 
-    @Volatile private var boundExplicitResolution = false
-
     @Volatile private var previewW = ANALYSIS_HEIGHT
     @Volatile private var previewH = ANALYSIS_WIDTH
 
@@ -186,12 +177,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var diagFirst16 = ""
     @Volatile private var diagFramesSeen = 0L
 
-    // ---- Diagnostic: what the analyser is actually receiving ----
-    // Refreshed on every frame. android.graphics.ImageFormat numbering:
-    //   35  YUV_420_888   ← correct; planes[0] is the Y plane
-    //   1   RGBA_8888     ← wrong; four bytes per pixel, R G B A ...
-    //   17  NV21          ← wrong for Y-plane reading
-    //   256 JPEG          ← wrong entirely
+    // ---- Format diagnostics ----
     @Volatile private var lastImageFormat = -1
     @Volatile private var lastPlanesCount = 0
     @Volatile private var lastPixelStride = 0
@@ -276,14 +262,11 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     } else {
                         main.post {
                             try {
-                                android.util.Log.i(
-                                    TAG,
-                                    "setResolution($want): rebind with explicit size",
-                                )
+                                android.util.Log.i(TAG, "setResolution($want): rebind")
                                 targetShortSide = want
                                 shortSide = want
                                 firstFrameReceived = false
-                                rebindUseCases(explicitResolution = true)
+                                rebindUseCases()
                                 result.success(null)
                             } catch (e: Throwable) {
                                 android.util.Log.e(TAG, "rebind failed", e)
@@ -350,7 +333,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         try {
                             android.util.Log.i(TAG, "manual rebind (kickStream)")
                             firstFrameReceived = false
-                            rebindUseCases(explicitResolution = boundExplicitResolution)
+                            shortSide = targetShortSide
+                            rebindUseCases()
                         } catch (_: Throwable) {}
                     }
                     result.success(null)
@@ -372,7 +356,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "bufH" to bufH,
                             "shortSide" to shortSide,
                             "targetShortSide" to targetShortSide,
-                            "boundExplicitResolution" to boundExplicitResolution,
                             "starting" to starting,
                             "sessionId" to sessionId,
                             "boundShortSide" to boundShortSide,
@@ -399,8 +382,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "diagAvg" to diagAvg,
                             "diagFirst16" to diagFirst16,
                             "diagFramesSeen" to diagFramesSeen,
-                            // ---- image format (what the analyser is
-                            // actually receiving) ----
                             "lastImageFormat" to lastImageFormat,
                             "lastPlanesCount" to lastPlanesCount,
                             "lastPixelStride" to lastPixelStride,
@@ -575,7 +556,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 sessionId = ++lastSessionId
                 ensureScanner(detect, sr, detectPath, srPath, borrowed)
                 if (shortSide != boundShortSide) {
-                    try { rebindUseCases(explicitResolution = true) } catch (e: Throwable) {
+                    try { rebindUseCases() } catch (e: Throwable) {
                         android.util.Log.e(TAG, "rebind on takeover failed", e)
                     }
                 }
@@ -607,7 +588,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     try {
                         val provider = future.get()
                         cameraProvider = provider
-                        bindUseCases(st, explicitResolution = false)
+                        bindUseCases(st)
                         sessionId = ++lastSessionId
                         starting = false
                         main.post { result.success(infoMap(entry.id())) }
@@ -628,26 +609,24 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     }
 
     /**
-     * Binds Preview and ImageAnalysis.
+     * Binds Preview and ImageAnalysis in a single bindToLifecycle.
      *
-     * [explicitResolution] = false (first bind, google-style):
-     *   Preview.Builder().build() — no settings at all.
-     *   ImageAnalysis.Builder().setBackpressureStrategy(KEEP_LATEST).build()
-     *     — only that; no size, no format, no rotation.
+     * The configuration is exactly what worked on the first try on this
+     * Huawei, and every variation that removed one of these three was worse:
+     *   - setTargetResolution(desiredSize)
+     *   - setOutputImageFormat(YUV_420_888)
+     *   - setTargetRotation(...)
      *
-     * [explicitResolution] = true (from setResolution):
-     *   setTargetResolution(desiredSize) added to both builders.
-     *
-     * No `setOutputImageFormat` in either path: CameraX defaults to
-     * YUV_420_888, and the first bind's diagnostics show whether the HAL
-     * actually delivers it (format 35, three planes, pixelStride 1) or
-     * substitutes something else.
+     * Without setTargetResolution, the HAL delivers 0x0 frames.
+     * Without setOutputImageFormat(YUV), the HAL may substitute RGBA and
+     *   Rust reads 1/4 of the pixels as Y.
+     * Without setTargetRotation, the frame arrives at whatever rotation the
+     *   sensor happened to be in, and the picker markers drift.
      */
-    private fun bindUseCases(st: SurfaceTexture, explicitResolution: Boolean) {
+    private fun bindUseCases(st: SurfaceTexture) {
         val provider = cameraProvider ?: return
         provider.unbindAll()
         boundShortSide = shortSide
-        boundExplicitResolution = explicitResolution
         bindCount++
 
         val desiredSize = targetSize(shortSide)
@@ -656,11 +635,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             .requireLensFacing(CameraSelector.LENS_FACING_BACK)
             .build()
 
-        val previewBuilder = Preview.Builder()
-        if (explicitResolution) {
-            previewBuilder.setTargetResolution(desiredSize)
-        }
-        val previewUseCase = previewBuilder.build()
+        val previewUseCase = Preview.Builder()
+            .setTargetResolution(desiredSize)
+            .setTargetRotation(Surface.ROTATION_0)
+            .build()
         previewUseCase.setSurfaceProvider { request: SurfaceRequest ->
             try {
                 val res = request.resolution
@@ -684,20 +662,20 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
         preview = previewUseCase
 
-        val analysisBuilder = ImageAnalysis.Builder()
+        val analysisUseCase = ImageAnalysis.Builder()
+            .setTargetResolution(desiredSize)
+            .setTargetRotation(lastTargetRotation)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-        if (explicitResolution) {
-            analysisBuilder.setTargetResolution(desiredSize)
-        }
-        val analysisUseCase = analysisBuilder.build()
+            .build()
         analysisUseCase.setAnalyzer(camExec, ::analyze)
         analysis = analysisUseCase
 
         android.util.Log.i(
             TAG,
-            "bind #$bindCount: " +
-            (if (explicitResolution) "explicit-resolution" else "google-style") +
-            " (target=$targetShortSide explicit=$explicitResolution)",
+            "bind #$bindCount: single bindToLifecycle(Preview, Analysis) " +
+            "at $desiredSize format=YUV_420_888 " +
+            "(target=$targetShortSide scanEnabled=$SCAN_ENABLED)",
         )
 
         try {
@@ -723,10 +701,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         diagFramesSeen = 0
     }
 
-    private fun rebindUseCases(explicitResolution: Boolean) {
+    private fun rebindUseCases() {
         try {
             val st = textureEntry?.surfaceTexture() ?: return
-            bindUseCases(st, explicitResolution)
+            bindUseCases(st)
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "rebindUseCases failed", e)
         }
@@ -1067,12 +1045,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     TAG,
                     "first frame arrived (${image.width}x${image.height} " +
                     "rot=${image.imageInfo.rotationDegrees}) — " +
-                    "target=$targetShortSide current=$shortSide " +
-                    "explicit=$boundExplicitResolution",
+                    "target=$targetShortSide current=$shortSide",
                 )
             }
 
-            // ---- Refresh format diagnostic ----
             lastImageFormat = image.format
             lastPlanesCount = image.planes.size
             val p0 = image.planes.getOrNull(0)
