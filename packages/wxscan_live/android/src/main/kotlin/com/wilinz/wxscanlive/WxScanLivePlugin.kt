@@ -47,22 +47,26 @@ import java.util.concurrent.Executors
  * Preview → Flutter SurfaceTexture (GPU, no CPU per frame); ImageAnalysis →
  * Y plane → Rust over JNI.
  *
- * **Bind configuration.** This is the configuration that works on this
- * Huawei: setTargetResolution, setOutputImageFormat(YUV_420_888) and
- * setTargetRotation, applied in one bindToLifecycle. Every previous
- * variation that removed one of those three produced 0x0 frames or a
- * silent analyser. They are all three back, exactly as they were in the
- * build that first attached the analyser on the very first open.
+ * **Bind configuration.** setTargetResolution, setOutputImageFormat(YUV_420_888)
+ * and setTargetRotation, applied in one bindToLifecycle — the configuration
+ * that first attached the analyser on this Huawei and every variation of
+ * which has been worse.
  *
- * **Format diagnostics.** Every frame refreshes [lastImageFormat],
- * [lastPlanesCount], [lastPixelStride], [lastRowStride], [lastFrameW],
- * [lastFrameH], [lastFrameRot]. All are surfaced in [debugState] and
- * rendered on the diagnostic panel:
+ * **Downscale rule.** Only frames above [MAX_FRAME_PIXELS] are downscaled,
+ * and when they are, the aspect ratio is preserved. This matters because
+ * Huawei HALs commonly ignore the 16:9 request and deliver a 1:1 frame
+ * (1728x1728 for a 1280x720 target); scaling that square to 1280x720 would
+ * stretch the QR into a rectangle, the CNN detector would still find the
+ * pattern (tolerant), and the decoder would fail to read it (strict) —
+ * exactly the "candidates > 0, results = 0" symptom. So a 1728x1728 frame
+ * passes through untouched, and only the genuinely oversized buffers
+ * (4096x2160 and up) are resized, proportionally, to fit under the cap.
  *
- *   format 35, planes 3, pixelStride 1  → YUV_420_888, correct
- *   format 1,  planes 1, pixelStride 4  → RGBA_8888, wrong
- *   format 17, planes 1, pixelStride 1  → NV21, wrong
- *   format 256, planes 1, pixelStride 1 → JPEG, wrong
+ * **Format diagnostics.** Every frame refreshes lastImageFormat,
+ * lastPlanesCount, lastPixelStride, lastRowStride, lastFrameW, lastFrameH,
+ * lastFrameRot. All are surfaced in debugState and shown on the diagnostic
+ * panel, so a phone with no adb answers "what did the analyser actually
+ * receive".
  *
  * **Buffer caching.** [yBuf], [nv21Buf], [downscaleBuf] are reused.
  *
@@ -89,7 +93,22 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         private const val SCAN_ENABLED = true
         private const val DIAG_FRAMES = 5
-        private const val DOWNSCALE_THRESHOLD = 2
+
+        /**
+         * Absolute pixel cap: frames above this are downscaled
+         * (proportionally) before Rust sees them.
+         *
+         * 4 million pixels is roughly 2000x2000. It leaves the 3-million-
+         * pixel 1728x1728 frame a Huawei HAL commonly delivers for a 720p
+         * request untouched, and only downscales the genuinely oversized
+         * buffers — 4096x2160 (8.8M) and above — that crashed the scanner
+         * in earlier tests. Everything below the cap goes to Rust with its
+         * geometry intact.
+         *
+         * Lower this if a crash returns: 2_000_000 is a safer cap, at the
+         * cost of downscaling the 1728x1728 case.
+         */
+        private const val MAX_FRAME_PIXELS = 4_000_000L
     }
 
     @Volatile private var scannerHandle: Long = 0L
@@ -177,7 +196,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var diagFirst16 = ""
     @Volatile private var diagFramesSeen = 0L
 
-    // ---- Format diagnostics ----
+    // Format diagnostics.
     @Volatile private var lastImageFormat = -1
     @Volatile private var lastPlanesCount = 0
     @Volatile private var lastPixelStride = 0
@@ -367,6 +386,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "bindCount" to bindCount,
                             "firstFrameReceived" to firstFrameReceived,
                             "scanEnabled" to SCAN_ENABLED,
+                            "maxFramePixels" to MAX_FRAME_PIXELS,
                             "desiredSize" to
                                 "${targetSize(targetShortSide).width}x" +
                                 "${targetSize(targetShortSide).height}",
@@ -608,21 +628,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
     }
 
-    /**
-     * Binds Preview and ImageAnalysis in a single bindToLifecycle.
-     *
-     * The configuration is exactly what worked on the first try on this
-     * Huawei, and every variation that removed one of these three was worse:
-     *   - setTargetResolution(desiredSize)
-     *   - setOutputImageFormat(YUV_420_888)
-     *   - setTargetRotation(...)
-     *
-     * Without setTargetResolution, the HAL delivers 0x0 frames.
-     * Without setOutputImageFormat(YUV), the HAL may substitute RGBA and
-     *   Rust reads 1/4 of the pixels as Y.
-     * Without setTargetRotation, the frame arrives at whatever rotation the
-     *   sensor happened to be in, and the picker markers drift.
-     */
     private fun bindUseCases(st: SurfaceTexture) {
         val provider = cameraProvider ?: return
         provider.unbindAll()
@@ -675,7 +680,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             TAG,
             "bind #$bindCount: single bindToLifecycle(Preview, Analysis) " +
             "at $desiredSize format=YUV_420_888 " +
-            "(target=$targetShortSide scanEnabled=$SCAN_ENABLED)",
+            "(target=$targetShortSide scanEnabled=$SCAN_ENABLED " +
+            "maxFramePixels=$MAX_FRAME_PIXELS)",
         )
 
         try {
@@ -1140,29 +1146,44 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 return
             }
 
-            val desiredSize = targetSize(targetShortSide)
-            val desiredPixels = desiredSize.width.toLong() * desiredSize.height
+            // ---- Downscale rule (proportional, only for genuinely huge frames) ----
+            //
+            // Only frames above MAX_FRAME_PIXELS are resized. Everything else
+            // is handed to Rust untouched, with its aspect ratio intact.
+            //
+            // This matters because Huawei HALs commonly ignore the 16:9
+            // request and deliver a 1:1 frame (1728x1728 for a 1280x720
+            // target). Scaling that square to 1280x720 would stretch the QR
+            // into a rectangle: the CNN detector still finds the pattern
+            // (tolerant) and the decoder cannot read it (strict), which is
+            // the "candidates > 0, results = 0" symptom. Passing 1728x1728
+            // through untouched keeps the QR square, and only the truly
+            // oversized buffers (4096x2160 and up) are resized — again
+            // proportionally, so a square stays a square and 16:9 stays 16:9.
             val framePixels = w.toLong() * h
-
-            if (framePixels > desiredPixels * DOWNSCALE_THRESHOLD) {
-                val dstSize = desiredSize.width * desiredSize.height
-                val dst = ensureDownscaleBuffer(dstSize)
+            if (framePixels > MAX_FRAME_PIXELS) {
+                val scale = Math.sqrt(MAX_FRAME_PIXELS.toDouble() / framePixels.toDouble()).toFloat()
+                val dstW = (w * scale).toInt().coerceAtLeast(1)
+                val dstH = (h * scale).toInt().coerceAtLeast(1)
+                val dst = ensureDownscaleBuffer(dstW * dstH)
                 downscaleGrayInto(
-                    y, dst, w, h, rowStride,
-                    desiredSize.width, desiredSize.height,
+                    y, dst, w, h, rowStride, dstW, dstH,
                 )
                 android.util.Log.i(
                     TAG,
-                    "downscale: ${w}x$h -> ${desiredSize.width}x${desiredSize.height}",
+                    "downscale (proportional): ${w}x$h ($framePixels px) " +
+                    "-> ${dstW}x$dstH (${dstW.toLong() * dstH} px)",
                 )
                 analyzedFrames++
                 busy = true
                 try {
-                    submitScan(dst, desiredSize.width, desiredSize.height, desiredSize.width, rot)
+                    submitScan(dst, dstW, dstH, dstW, rot)
                 } catch (_: java.util.concurrent.RejectedExecutionException) {
                     busy = false
                 }
             } else {
+                // Frame is under the cap — pass through with its real
+                // dimensions and rowStride, aspect ratio intact.
                 analyzedFrames++
                 busy = true
                 try {
