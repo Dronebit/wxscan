@@ -23,122 +23,52 @@ class ScanPage extends StatefulWidget {
 }
 
 class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
-  /// The camera. Null until it is opened, and everything about its state —
-  /// the preview size, the torch, the zoom — lives in `_controller.value`
-  /// rather than being mirrored here.
   WxScanController? _controller;
   StreamSubscription<ScanOutcome>? _sub;
   String? _error;
   bool _hasTorch = false;
   bool _nnEnabled = false;
 
-  /// Results from the most recent frame, used to draw the highlights.
   ScanOutcome? _lastFrame;
-
-  /// The frame frozen when one frame held several codes; non-null means we
-  /// are waiting for the user to pick one.
   ScanOutcome? _pickFrame;
-
-  /// The result page is up, so further frames are ignored.
   bool _navigating = false;
-
-  /// The device's maximum zoom, for zooming in automatically.
   double _maxZoom = 1;
 
-  /// The zoom the device last confirmed, which the controller keeps.
   double get _zoom => _controller?.value.zoom ?? 1;
 
-  /// Redraws when the controller's value changes: a rotation, a torch the
-  /// device confirmed, a zoom it clamped.
   void _onControllerChanged() {
     if (mounted) setState(() {});
   }
 
-  /// How many frames in a row saw a code without decoding it. Zooming waits
-  /// for enough of them, so the picture does not jitter.
   int _undecodableStreak = 0;
-
-  /// How many frames in a row saw nothing at all; enough of them and the
-  /// zoom is wound back.
   int _emptyStreak = 0;
-
-  /// When frames stopped holding anything at all, for [_blindFocus]. Null
-  /// while the last frame had something in it.
   DateTime? _nothingSince;
-
-  /// When "one code decoded, but more than one seen" started. Non-null means
-  /// we are waiting for the second one; see [_kMultiCodeGrace].
   DateTime? _multiWaitSince;
 
-  /// The capture resolution step. 720p by default; a dense code that will
-  /// not come out can be given more, at the cost of a slower frame.
   WxResolution _resolution = WxResolution.p720;
 
   DateTime _lastZoomAt = DateTime.fromMillisecondsSinceEpoch(0);
-
-  /// The ratio the pinch started at, which the gesture works from.
   double _gestureZoomBase = 1;
-
-  /// When the zoom was last set by hand. Automatic zooming keeps out for a
-  /// while afterwards, or the two fight each other.
   DateTime _manualZoomAt = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// The picture frozen while picking, which is the very frame that was
-  /// scanned, so the markers line up with it for free.
   Uint8List? _frozenFrame;
-
-  /// When picking was left. Automatic zooming holds off just afterwards, or
-  /// the user sees a zoom right after several codes flashed by.
   DateTime _pickExitAt = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// Where the last tap to focus landed, in the shell's coordinates, and the
-  /// timer that takes the reticle away again. Null when nothing is showing.
   Offset? _focusPoint;
   Timer? _focusTimer;
-
-  /// When focus was last pointed by hand. Automatic focusing keeps out for a
-  /// while afterwards, the way automatic zooming does.
   DateTime _manualFocusAt = DateTime.fromMillisecondsSinceEpoch(0);
-
-  /// When focus was last pointed automatically, and where to.
   DateTime _lastAutoFocusAt = DateTime.fromMillisecondsSinceEpoch(0);
   Offset? _lastAutoFocusPoint;
 
-  /// The ratio the zoom is walking towards, and the timer walking it there.
-  /// See [_stepZoom].
   double _zoomTarget = 1;
   Timer? _zoomDriver;
   var _zoomBusy = false;
-
-  /// How much of full speed the walk is up to, 0 to 1, and when it last
-  /// stepped. Together they make the walk neither start nor stop with a jerk;
-  /// see [_stepZoom].
   double _zoomRate = 0;
   DateTime _zoomSteppedAt = DateTime.fromMillisecondsSinceEpoch(0);
 
-  // ---------------------------------------------------------------------
-  // Diagnostics. These are what make a stalled camera visible without a
-  // computer: the frame count and the last frame's contents are shown on
-  // the screen, and the watchdog turns seven seconds of silence into a
-  // message instead of an empty viewfinder.
-  // ---------------------------------------------------------------------
-
-  /// Fires seven seconds after boot if no frame has arrived. Without this,
-  /// a camera that never delivers frames looks exactly like a camera that
-  /// is pointed at a blank wall.
   Timer? _watchdogTimer;
-
-  /// Frames received from the analyser since boot. The one number that says
-  /// whether the camera is delivering anything at all.
   int _rawFrameCount = 0;
-
-  /// A one-line summary of the last frame, shown on screen:
-  /// `frame #N: WxH r=.. c=..` or `frame #N: 0x0 (driver bug)`.
   String _lastFrameInfo = 'waiting for first frame';
-
-  /// The last few log lines, kept in memory so the debug panel can show them
-  /// on a phone with no computer attached. Bounded so a long session does not
-  /// grow the heap.
   final List<String> _logBuffer = [];
 
   @override
@@ -151,8 +81,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   Future<void> _boot() async {
     _log('boot: start');
 
-    // A retry reuses this state, so anything the previous boot left behind
-    // has to go first: the watchdog, the frame count, a previous controller.
     _watchdogTimer?.cancel();
     _watchdogTimer = null;
     _rawFrameCount = 0;
@@ -169,18 +97,13 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     try {
       _nnEnabled = await Scanner.init();
       if (kDebugMode) {
-        // Verify both paths on a device: direct FFI and the native camera path.
         unawaited(Scanner.selfTest());
       }
 
-      // permission_handler has no macOS implementation, so on the desktop
-      // the plugin asks AVFoundation itself inside initialize, which brings
-      // up the system prompt the first time.
       if (defaultTargetPlatform == TargetPlatform.android ||
           defaultTargetPlatform == TargetPlatform.iOS) {
         final status = await Permission.camera.request();
         if (!status.isGranted) {
-          // The prompt can be answered after the page is gone.
           if (mounted) {
             setState(() => _error = 'Camera permission is needed to scan');
           }
@@ -188,19 +111,11 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
         }
       }
 
-      // One scanner for the whole application: the camera decodes with the
-      // same one that reads pictures from the library, so there is a single
-      // copy of the weights and a single set of thresholds. Scanner.instance
-      // is null only if init() failed, and then the controller builds its own
-      // from the model bytes.
       final controller = WxScanController(
         scanner: Scanner.instance,
         resolution: _resolution,
       );
       await controller.initialize(
-        // Only reached when init() failed and there is no scanner to lend, so
-        // the camera builds its own. Bytes in a browser, paths everywhere
-        // else; exactly one pair is set.
         detectModel: Scanner.detectModel,
         srModel: Scanner.srModel,
         detectModelPath: Scanner.detectModelPath,
@@ -220,13 +135,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
         controller.dispose();
         return;
       }
-      // Wired up only once the page is certain to keep this controller.
-      // Subscribing before the check above left the frame subscription alive
-      // on a page that had already been popped: `dispose` had run, with
-      // nothing in `_sub` to cancel.
-      //
-      // The preview size lives in the controller and follows rotations by
-      // itself; the listener only asks the screen to redraw when it changes.
       controller.addListener(_onControllerChanged);
       _sub = controller.scans.listen(_onFrame, onError: (Object e, StackTrace st) {
         _log('scan stream error: $e');
@@ -239,28 +147,12 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
             : 'The native scanner failed to load';
       });
 
-      // ---- The critical call ----
-      // Opening the camera brings the pipeline up but does not start sending
-      // frames to the analysis stream; that takes an explicit
-      // setScanning(true). Calling it before the preview is laid out leaves a
-      // black frame on Android, so it waits for the first post-frame
-      // callback. Without this call the viewfinder works and nothing
-      // decodes: the Dart stream of ScanOutcome stays empty forever, and the
-      // only visible symptom is that the user points at a code and nothing
-      // happens.
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || _controller == null) return;
         _controller!.setScanning(true);
         _log('scanning started post-frame');
       });
 
-      // ---- Watchdog ----
-      // Seven seconds to first frame. If the analyser has delivered nothing
-      // by then, something is wrong that a retry may fix and silence will
-      // not: no frames from the driver, a native scanner handle of zero, an
-      // output format the bridge cannot read, a build with no Rust
-      // libraries. On Huawei this fires when p1080 or an RGBA format means
-      // the camera never produces a YUV frame.
       _watchdogTimer = Timer(const Duration(seconds: 7), () {
         if (!mounted || _rawFrameCount > 0) return;
         _log('watchdog: no frames in 7s');
@@ -281,14 +173,8 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   }
 
   void _onFrame(ScanOutcome frame) {
-    // Every frame gets counted, including the ones that are discarded below:
-    // the count says whether the camera is delivering anything, which is a
-    // different question from whether anything was decoded.
     _rawFrameCount++;
 
-    // Log the first handful of frames in full. On a phone with no adb this
-    // shows up in `flutter run` if a dev build is running; on a release
-    // build it is cheap and harmless.
     if (_rawFrameCount <= 5) {
       _log(
         'frame #$_rawFrameCount: ${frame.width}x${frame.height} '
@@ -297,27 +183,17 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
       );
     }
 
-    // A frame with pixels has arrived. If the watchdog already showed a
-    // message — because it fired a moment before the driver caught up, or
-    // because a transient stream error was set — clear it. The camera is
-    // working; a stale error would be a lie.
     if (_rawFrameCount == 1) {
       _watchdogTimer?.cancel();
       _watchdogTimer = null;
-      if (_error != null &&
-          _error!.contains('not delivering frames')) {
+      if (_error != null && _error!.contains('not delivering frames')) {
         setState(() => _error = null);
       }
     }
 
-    // A frame with no pixels is the Huawei driver bug, not a picture with
-    // nothing in it. It carries no image data, so nothing can be decoded
-    // and nothing can be highlighted. Say so in the diagnostic line rather
-    // than treating it as "nothing found".
     if (frame.width == 0 || frame.height == 0) {
       if (mounted) {
-        setState(() => _lastFrameInfo =
-            'frame #$_rawFrameCount: 0x0 (driver)');
+        setState(() => _lastFrameInfo = 'frame #$_rawFrameCount: 0x0 (driver)');
       } else {
         _lastFrameInfo = 'frame #$_rawFrameCount: 0x0 (driver)';
       }
@@ -334,13 +210,9 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
           'r=${frame.results.length} c=${frame.candidates.length}';
     }
 
-    // Do not refresh while picking, or the codes jump about with each new
-    // frame and cannot be tapped.
     if (!mounted || _navigating) return;
     setState(() => _lastFrame = frame);
 
-    // Picking is frozen: the picture is held, scanning has stopped, and new
-    // frames are ignored.
     if (_pickFrame != null) return;
 
     if (frame.results.isEmpty) {
@@ -350,14 +222,9 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
       _blindFocus(frame);
       return;
     }
-    // Decoded, so the zoom has done its job and is wound back.
     _resetZoom();
     _nothingSince = null;
 
-    // Several codes in one frame: freeze the picture and let the user pick.
-    // Freezing is required -- with the preview still running the picture
-    // changes with every movement of the hand, while the markers belong to
-    // this one frame, and the two can never line up.
     if (frame.results.length > 1) {
       _multiWaitSince = null;
       HapticFeedback.mediumImpact();
@@ -365,24 +232,15 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
       return;
     }
 
-    // One decoded, but detection saw more than one box: there are probably
-    // two codes in view and the other has not come out in this frame yet
-    // (frames are a good deal slower with several codes). Going to the result
-    // page now would mean the user never gets the chance to pick, so wait a
-    // few frames for the second one.
     if (frame.candidates.length > 1) {
       final now = DateTime.now();
       _multiWaitSince ??= now;
-      // If it does not arrive, take the single code: the other may be too
-      // small or too blurred to decode at all.
       if (now.difference(_multiWaitSince!) < _kMultiCodeGrace) return;
     }
     _multiWaitSince = null;
     _openResults(frame.results);
   }
 
-  /// Enters picking: stops scanning and freezes the current picture, which
-  /// is the very frame that was scanned.
   Future<void> _enterPick(ScanOutcome frame) async {
     setState(() => _pickFrame = frame);
     await _controller!.setScanning(false);
@@ -396,9 +254,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     setState(() {
       _pickFrame = null;
       _frozenFrame = null;
-      // The previous frame's results go too: otherwise, until a new frame
-      // arrives, the markers keep being drawn from the frame before picking
-      // began, which looks like a box that will not go away.
       _lastFrame = null;
     });
     _pickExitAt = DateTime.now();
@@ -426,28 +281,16 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
         });
   }
 
-  /// Zooms in automatically: a code that is seen but will not decode is
-  /// usually too small, so move closer for the user.
-  ///
-  /// The evidence comes from the candidate boxes of Rust's detection stage --
-  /// boxes without results means seen but not read. An empty result set alone
-  /// is not enough, since it is also empty when there is no code in view at
-  /// all, and zooming then is pure nuisance.
   void _autoZoom(ScanOutcome frame) {
     final nowTs = DateTime.now();
-    // Do not grab the wheel just after the user zoomed by hand, or just
-    // after picking ended.
     if (nowTs.difference(_manualZoomAt) < _kManualZoomHold) return;
     if (nowTs.difference(_pickExitAt) < _kPickExitZoomHold) return;
     if (!frame.hasUndecodable) {
       _undecodableStreak = 0;
-      // Seeing nothing for long enough winds the zoom back, or it would
-      // stay zoomed in for good.
       if (frame.candidates.isEmpty && ++_emptyStreak > 45) _resetZoom();
       return;
     }
     _emptyStreak = 0;
-    // Only act after several frames agree; one frame can misdetect.
     if (++_undecodableStreak < 3) return;
 
     final box = _largestCandidateBox(frame);
@@ -455,37 +298,16 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     final frac = math.max(box.w, box.h);
     if (frac <= 0 || frac >= _kZoomTargetFraction) return;
 
-    // This much is wanted, but not more than keeps the code inside the
-    // frame, so take the smaller.
     final rel = math.min(_kZoomTargetFraction / frac, _safeZoomHeadroom(box));
     final want = (_zoom * rel)
         .clamp(1.0, math.min(_maxZoom, _kMaxAutoZoom))
         .toDouble();
-    // Nothing worth walking towards.
     if (want <= _zoom * 1.02) return;
 
-    // Only the target is set here. Every frame revises it, and as the picture
-    // closes in the code grows, `frac` with it and the target comes down to
-    // meet the ratio — so this settles itself rather than overshooting.
     _zoomTarget = want;
     _startZoomDriver();
   }
 
-  /// Walks the zoom towards [_zoomTarget].
-  ///
-  /// Setting the ratio straight to the target moves the picture in one jump,
-  /// which is what a scanner looks like when it is guessing, and it throws the
-  /// code the user was holding steady somewhere else. But an even walk in
-  /// fixed steps is no better: ten visible steps a second is a slideshow, and
-  /// it starts and stops dead.
-  ///
-  /// So: a step every [_kZoomStepEvery], each one closing a fixed *fraction*
-  /// of what is left. That decelerates into the target on its own, the way a
-  /// hand does. Two things shape it further — the arithmetic is done on the
-  /// logarithm of the ratio, since zoom is multiplicative and equal steps are
-  /// only equal to the eye there; and the speed is ramped in over
-  /// [_kZoomRampIn] rather than being at full rate from the first step, which
-  /// is what made the start read as a lurch.
   void _startZoomDriver() {
     if (_zoomDriver != null) return;
     _zoomRate = 0;
@@ -500,8 +322,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   }
 
   void _stepZoom() {
-    // One call at a time: the ratio that took effect comes back from the
-    // device, and stepping from a stale one walks past the target.
     if (_zoomBusy) return;
     final from = _zoom;
     if ((_zoomTarget / from - 1).abs() < 0.005) {
@@ -509,8 +329,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
       return;
     }
 
-    // Measured rather than assumed: a timer under load fires late, and a step
-    // sized for 33ms taken after 90 would crawl.
     final now = DateTime.now();
     final dt = now.difference(_zoomSteppedAt).inMicroseconds / 1e6;
     _zoomSteppedAt = now;
@@ -520,9 +338,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
       1.0,
       _zoomRate + dt / (_kZoomRampIn.inMilliseconds / 1000),
     );
-    // The fraction of the remaining distance a step of this length closes.
-    // Written as an exponential so the walk looks the same however often the
-    // timer actually fires.
     final k = 1 - math.exp(-dt / (_kZoomSettle.inMilliseconds / 1000));
 
     final logFrom = math.log(from);
@@ -534,10 +349,7 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     _controller!.setZoom(next).then((actual) {
       _zoomBusy = false;
       if (!mounted) return;
-      // The controller already holds it; this only redraws.
       setState(() {});
-      // The device would go no further. Asking again every step would be a
-      // platform call thirty times a second for nothing.
       if ((actual - from).abs() < 0.0005 && _zoomRate >= 1) {
         _zoomTarget = actual;
         _stopZoomDriver();
@@ -545,41 +357,18 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     });
   }
 
-  /// Focuses on a code that is seen but will not decode.
-  ///
-  /// A small code is usually a soft one as well: it sits somewhere inside the
-  /// frame, and continuous auto-focus, which weighs the middle of the picture,
-  /// holds the wall behind it sharp instead. Pointing focus at the box is
-  /// often the whole difference between a code that comes out and one that
-  /// does not, and it costs nothing where the code was sharp already.
-  ///
-  /// Kept apart from [_autoZoom]: the two answer the same trouble by different
-  /// means, and a code too far off centre to zoom towards -- CameraX zooms
-  /// about the centre and nowhere else -- can still be focused on.
   void _autoFocus(ScanOutcome frame) {
     if (!frame.hasUndecodable) return;
 
-    // One frame is enough, where the zoom waits for three. The two are not
-    // the same bet: a zoom that fires on a misdetection throws the picture
-    // about and loses whatever the user was aiming at, while a focus that
-    // fires on one is at worst a lens moving to a place with nothing there,
-    // which the next frame corrects and which costs nothing meanwhile. Waiting
-    // three frames only delays the reading it was going to make possible.
     final now = DateTime.now();
     if (now.difference(_manualFocusAt) < _kManualFocusHold) return;
     if (now.difference(_lastAutoFocusAt) < _kAutoFocusInterval) return;
 
     final box = _largestCandidateBox(frame);
     if (box == null) return;
-    // Only the small ones. A code filling much of the picture is already
-    // where continuous focus is looking, and pointing at it again would only
-    // set the lens hunting.
     final frac = math.max(box.w, box.h);
     if (frac <= 0 || frac >= _kAutoFocusMaxFraction) return;
 
-    // A code sitting still is focused on once, not every second and a half:
-    // each request starts the lens moving again, and a picture that keeps
-    // softening and sharpening is worse than one that settled.
     final point = Offset(box.cx, box.cy);
     final last = _lastAutoFocusPoint;
     if (last != null &&
@@ -597,40 +386,19 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     unawaited(_controller!.focusAt(x, y));
   }
 
-  /// Focuses when there is nothing to focus on.
-  ///
-  /// [_autoFocus] needs a candidate box, and a picture too soft to detect
-  /// anything in has none. That is a state that holds itself shut: no box, so
-  /// nothing asks for focus, so the box never comes. A scanner opens in it
-  /// whenever the lens is left where the last session put it, and continuous
-  /// auto-focus does not rescue it — continuous reacts to what changes, and a
-  /// phone held steady over a code changes nothing.
-  ///
-  /// So stop waiting for the detector. Once a second of frames has held
-  /// neither a result nor a candidate, the picture is worth nothing as it
-  /// stands: a scan at the centre is the only thing that can change that, and
-  /// there is no reading in progress for it to interrupt.
   void _blindFocus(ScanOutcome frame) {
     final now = DateTime.now();
     if (frame.candidates.isNotEmpty) {
       _nothingSince = null;
       return;
     }
-    // Timed rather than counted in frames, which is what everything else here
-    // does: a frame is a whole CNN pass, so its rate falls with the resolution
-    // and with the device, and a count of them would mean half a second on one
-    // phone and three on another.
     final since = _nothingSince ??= now;
     if (now.difference(since) < _kBlindFocusAfter) return;
 
     if (now.difference(_manualFocusAt) < _kManualFocusHold) return;
-    // Shares the clock with [_autoFocus] so the two cannot both drive the
-    // lens: whichever has something to say, the other holds off.
     if (now.difference(_lastAutoFocusAt) < _kBlindFocusInterval) return;
 
     _lastAutoFocusAt = now;
-    // Nothing was aimed at, so there is no point to compare the next one
-    // against.
     _lastAutoFocusPoint = null;
     unawaited(_controller!.focusAt(0.5, 0.5));
   }
@@ -639,13 +407,10 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     _undecodableStreak = 0;
     _emptyStreak = 0;
     if (_zoomTarget == 1 && _zoom == 1) return;
-    // Back out the way it came in, rather than dropping to 1x in one frame.
     _zoomTarget = 1;
     _startZoomDriver();
   }
 
-  /// The largest candidate box, with coordinates normalised to [0,1] in each
-  /// dimension.
   ({double cx, double cy, double w, double h})? _largestCandidateBox(
     ScanOutcome f,
   ) {
@@ -677,15 +442,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     return best;
   }
 
-  /// How much further it can zoom without pushing the code out of frame.
-  ///
-  /// CameraX can only zoom about the *centre* of the picture; there is no API
-  /// for a zoom centre. So the further the code is from the centre, the less
-  /// room there is. At a zoom of z the visible region is a window of side 1/z
-  /// centred on 0.5, and keeping the code entirely inside it requires
-  /// |c-0.5| + half the side <= 1/(2z). For a code far off centre this comes
-  /// out near 1, meaning it should not zoom: doing so would only lose the code
-  /// further, and waiting for the user to move over is better.
   double _safeZoomHeadroom(({double cx, double cy, double w, double h}) box) {
     double axis(double center, double size) {
       final margin = (center - 0.5).abs() + size / 2;
@@ -695,8 +451,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     return math.min(axis(box.cx, box.w), axis(box.cy, box.h));
   }
 
-  /// Pinch to zoom. One-finger scale events are ignored, or a tap to pick
-  /// would be taken for a zoom.
   void _onScaleStart(ScaleStartDetails d) {
     if (d.pointerCount >= 2) _gestureZoomBase = _zoom;
   }
@@ -704,36 +458,19 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   void _onScaleUpdate(ScaleUpdateDetails d) {
     if (d.pointerCount < 2) return;
     final now = DateTime.now();
-    // Gesture updates come thick, so they are throttled rather than
-    // flooding setZoomRatio.
     if (now.difference(_lastZoomAt) < const Duration(milliseconds: 60)) return;
 
     final want = (_gestureZoomBase * d.scale).clamp(1.0, _maxZoom).toDouble();
     if ((want - _zoom).abs() < 0.02) return;
     _lastZoomAt = now;
     _manualZoomAt = now;
-    // The hand is on it: the walk has nothing left to do, and would otherwise
-    // pull against the fingers.
     _stopZoomDriver();
     _zoomTarget = want;
     _controller!.setZoom(want).then((actual) {
-      // The controller already holds it; this only redraws.
       if (mounted) setState(() {});
     });
   }
 
-  /// Tap to focus.
-  ///
-  /// The preview is drawn by turning the picture through
-  /// [WxPreviewSize.quarterTurns] and covering the box with what comes out, so
-  /// a tap is brought back the other way: undo the cover fit against the
-  /// turned size, then undo the turn, which leaves the fraction of the
-  /// picture the plugin's own coordinates are in.
-  ///
-  /// A tap outside the picture — the bands a cover fit crops away are off the
-  /// box, but a letterboxed one leaves them on it — is dropped rather than
-  /// clamped, so the reticle never appears somewhere the camera is not
-  /// looking.
   void _onFocusTap(Offset tap, Size box) {
     final size = _controller?.value.previewSize;
     if (size == null || _controller == null) return;
@@ -754,8 +491,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     unawaited(_controller!.focusAt(x, y));
   }
 
-  /// The layer that takes those taps, under the bars so their buttons are
-  /// still buttons, and under the picker so picking a code still wins.
   Widget _buildFocusLayer() {
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -769,8 +504,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     );
   }
 
-  /// The layer for picking among several codes: tap a marker to open that
-  /// code, tap anywhere else to go on scanning.
   Widget _buildPicker(ScanOutcome frame) {
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -782,25 +515,18 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
             if (hit != null) {
               _openResults([hit]);
             } else {
-              // Tapping elsewhere gives up on picking and scans on.
               _exitPick();
             }
           },
           child: Stack(
             fit: StackFit.expand,
             children: [
-              // The frozen frame covers the live preview. It is the same
-              // frame at the same size, so the markers below line up exactly
-              // under the same cover mapping.
               if (_frozenFrame != null)
                 Image.memory(
                   _frozenFrame!,
                   fit: BoxFit.cover,
                   gaplessPlayback: true,
                 ),
-              // Filled explicitly: hit-testing uses the LayoutBuilder's size
-              // and drawing uses the CustomPaint's, and the two have to agree
-              // or taps and markers drift apart systematically.
               CustomPaint(
                 size: Size.infinite,
                 painter: PickPainter(frame: frame, fit: BoxFit.cover),
@@ -812,22 +538,12 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     );
   }
 
-  /// Cycles the capture resolution: 720p, 1080p, highest, and round again.
-  ///
-  /// The higher steps are for dense codes -- high version, many small modules,
-  /// which simply will not come out without the pixels. The cost is a scan
-  /// time that roughly follows the pixel count, which is why the default stays
-  /// at 720p.
   Future<void> _cycleResolution() async {
     const order = WxResolution.values;
     final next = order[(order.indexOf(_resolution) + 1) % order.length];
     setState(() {
       _resolution = next;
-      // A change of resolution changes the frame size, so the old results'
-      // coordinates no longer mean anything.
       _lastFrame = null;
-      // A resolution change rebuilds the use cases; the analyser will start
-      // delivering again only after the new bind is up.
       _rawFrameCount = 0;
       _lastFrameInfo = 'changing to ${next.label}...';
     });
@@ -840,9 +556,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     }
   }
 
-  /// Opens the diagnostic panel. Always available, because a release build
-  /// is exactly the build that needs it when the scanner silently does
-  /// nothing.
   Future<void> _openDebugPanel() async {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
@@ -851,8 +564,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     );
   }
 
-  /// Decoding from the photo library, through the same Rust path the camera
-  /// uses.
   Future<void> _pickFromGallery() async {
     final PickedPicture? picked;
     try {
@@ -867,8 +578,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
       }
       return;
     }
-    // Aliased so the closure below can see it as non-null: a final assigned
-    // inside a try is not promoted into one.
     if (picked == null || !mounted) return;
     final found = picked.outcome;
     if (found.results.isEmpty) {
@@ -887,8 +596,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     _navigating = true;
     await _controller!.setScanning(false);
     if (!mounted) return;
-    // Several codes in one picture, as on the home screen: the picture is
-    // shown with a marker on each, and the reader says which.
     var results = found.results;
     if (results.length > 1) {
       final image = await picked.file.readAsBytes();
@@ -915,9 +622,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Scanning stops in the background and resumes on return. The observer is
-    // registered in initState, so this can arrive before the camera is up —
-    // or never see one at all, if permission was refused.
     if (state == AppLifecycleState.resumed) {
       _controller?.setScanning(!_navigating);
     } else {
@@ -938,11 +642,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  /// Logs a diagnostic line. The name `wxscan.scan` keeps the scanner's
-  /// own output apart from the plugin's (`wxscan_live`) when reading
-  /// `flutter run` or logcat. The last few lines are also kept in
-  /// [_logBuffer], so the debug panel can show them on a phone with no
-  /// computer attached.
   void _log(String msg) {
     final stamp = DateTime.now().toIso8601String().substring(11, 23);
     _logBuffer.add('$stamp $msg');
@@ -954,8 +653,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    // Back while picking should leave picking and go on scanning, not leave
-    // the page.
     return PopScope(
       canPop: _pickFrame == null,
       onPopInvokedWithResult: (didPop, _) {
@@ -964,10 +661,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
       },
       child: Scaffold(
         backgroundColor: Colors.black,
-        // The zoom gesture wraps everything: as a layer inside the Stack it
-        // would be shadowed by the hit-testing of the layers above. It does not
-        // conflict with the tap to pick inside -- the gesture arena settles it,
-        // one finger to the tap and two to the zoom.
         body: GestureDetector(
           behavior: HitTestBehavior.deferToChild,
           onScaleStart: _onScaleStart,
@@ -977,11 +670,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
               fit: StackFit.expand,
               children: [
                 if (_controller != null) _buildPreview(_controller!),
-                // Decoration, and nothing that can be pressed. Without this a
-                // CustomPaint takes every tap that reaches it: RenderCustomPaint
-                // answers hitTestSelf with true unless its painter says otherwise,
-                // so the viewfinder alone would swallow the taps meant for the
-                // layer below it.
                 const IgnorePointer(child: _ScanLineOverlay()),
                 if (_lastFrame != null &&
                     _controller != null &&
@@ -993,8 +681,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
                   ),
                 if (_controller != null) _buildFocusLayer(),
                 if (_focusPoint != null) _FocusReticle(at: _focusPoint!),
-                // Below the top and bottom bars, or its opaque hit-testing would
-                // swallow taps meant for those buttons.
                 if (_pickFrame != null) _buildPicker(_pickFrame!),
                 _buildTopBar(),
                 if (_error != null) _buildError(_error!),
@@ -1008,10 +694,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   }
 
   Widget _buildPreview(WxScanController controller) {
-    // The preview is always upright with respect to the device's natural
-    // orientation, so however far the screen turned is made up here, and the
-    // box outside is sized to the dimensions after that. The two have to
-    // agree, or BoxFit.cover stretches by the wrong ratio.
     final size = controller.value.previewSize;
     if (size == null) return const SizedBox.shrink();
     return ClipRect(
@@ -1034,9 +716,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   }
 
   Widget _buildTopBar() {
-    // Aligned rather than dropped straight into the stack: an expanded stack
-    // hands its children tight constraints, and a row told it is as tall as
-    // the screen centres its contents down the middle of it.
     return Align(
       alignment: Alignment.topCenter,
       child: SafeArea(
@@ -1048,12 +727,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     );
   }
 
-  /// The top bar while picking: how to leave, and what to do.
-  ///
-  /// Both used to live inside the picker itself, where the back button landed
-  /// on top of the title and the bottom bar went on telling the user to put a
-  /// code in the frame while this one told them to tap a marker. One bar at a
-  /// time says one thing.
   Widget _buildPickBar() {
     return Row(
       children: [
@@ -1072,26 +745,16 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     );
   }
 
-  /// The height of the bar's first line, which is the back button's: an
-  /// IconButton is a touch target before it is an icon, and everything beside
-  /// it is centred against that rather than hung from the top.
   static const double _barLine = 48;
 
   Widget _buildScanBar() {
     return Row(
-      // Top-aligned, so a second run of chips grows downwards instead of
-      // pushing the button and the title off the line they share. Each
-      // side centres itself within [_barLine] instead.
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         SizedBox(
           height: _barLine,
           child: Row(
             children: [
-              // Reached by a push from the home screen, so there has to be
-              // a way back that is not the system gesture: iOS and macOS
-              // do not have Android's, and nobody guesses at a tap on the
-              // picture.
               IconButton(
                 onPressed: () => Navigator.of(context).maybePop(),
                 tooltip: 'Back',
@@ -1114,15 +777,7 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
           ),
         ),
         const SizedBox(width: 12),
-        // A narrow phone cannot hold the title and both chips on one
-        // line, so they wrap under each other rather than overflowing.
-        // One run sits centred on the button's line; two make the box
-        // taller and fill it.
         Expanded(
-          // ConstrainedBox and a shrink-wrapping Align, not a Container
-          // with an alignment: that one grows to whatever it is offered,
-          // and what it is offered here is the height of the screen, which
-          // put the chips down in the middle of the picture.
           child: ConstrainedBox(
             constraints: const BoxConstraints(minHeight: _barLine),
             child: Align(
@@ -1133,8 +788,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
                 spacing: 8,
                 runSpacing: 6,
                 children: [
-                  // The resolution step, raised by a tap. Useful when a
-                  // dense code will not come out.
                   _chip(
                     _resolution.label,
                     onTap: _controller == null ? null : _cycleResolution,
@@ -1152,7 +805,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
     );
   }
 
-  /// The small rounded label of the top bar. Tappable when given an onTap.
   Widget _chip(String text, {VoidCallback? onTap, IconData? icon}) {
     final body = Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
@@ -1212,15 +864,11 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   }
 
   Widget _buildBottomBar() {
-    // The top bar is doing the talking while picking, and the torch and the
-    // gallery are no use with a frozen frame on screen.
     if (_pickFrame != null) return const SizedBox.shrink();
     return Align(
       alignment: Alignment.bottomCenter,
       child: SafeArea(
         child: Padding(
-          // A phone in landscape has barely any room below the viewfinder,
-          // and 40 of it would put the buttons off the bottom.
           padding: EdgeInsets.only(
             bottom: MediaQuery.sizeOf(context).height < 560 ? 12 : 40,
           ),
@@ -1232,14 +880,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
                     ? '${_zoom.toStringAsFixed(1)}x - pinch to zoom'
                     : 'Put the QR code in the frame to scan it',
               ),
-              // Diagnostic line: always visible, release or debug. A red
-              // strip, so it cannot be mistaken for a hint. On a phone with
-              // no computer attached this is the only way to see whether
-              // frames are arriving — `waiting for first frame` means
-              // setScanning(true) never reached the native side or the
-              // driver is silent; `frame #N: 0x0 (driver)` is the Huawei
-              // zero-size bug; `frame #N: WxH r=0 c=0` means frames arrive
-              // and the detector sees nothing; `r=1` means it decoded.
               const SizedBox(height: 8),
               Container(
                 padding: const EdgeInsets.symmetric(
@@ -1284,9 +924,6 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
                     icon: const Icon(Icons.photo_library_outlined),
                   ),
                   const SizedBox(width: 24),
-                  // Debug panel: opens the Dart-side diagnostic view. Always
-                  // shown, because a release build is exactly the build that
-                  // needs it when a scanner silently does nothing.
                   IconButton.filledTonal(
                     onPressed: _openDebugPanel,
                     icon: const Icon(Icons.bug_report_outlined),
@@ -1301,10 +938,10 @@ class _ScanPageState extends State<ScanPage> with WidgetsBindingObserver {
   }
 }
 
-/// Diagnostic panel that opens from the scanner's bug button. Shows Dart-
-/// side counters and the last dozen log lines, refreshed every 700 ms.
-/// No native calls — the panel is a pure Dart view, so it works even when
-/// the native layer is dead (which is exactly when it is needed most).
+/// Diagnostic panel that reads the plugin's `debugState` map every 700 ms
+/// and renders it grouped by what it answers: what the controller thinks,
+/// what the analyser is receiving, what the scanner is doing. No native
+/// calls of its own — it works even when the native layer is dead.
 class _DebugPanelPage extends StatefulWidget {
   final _ScanPageState state;
   const _DebugPanelPage({required this.state});
@@ -1315,16 +952,28 @@ class _DebugPanelPage extends StatefulWidget {
 
 class _DebugPanelPageState extends State<_DebugPanelPage> {
   Timer? _poll;
+  Map<String, dynamic> _native = {};
 
   @override
   void initState() {
     super.initState();
+    _refresh();
     _poll = Timer.periodic(
       const Duration(milliseconds: 700),
-      (_) {
-        if (mounted) setState(() {});
-      },
+      (_) { _refresh(); },
     );
+  }
+
+  Future<void> _refresh() async {
+    try {
+      final r = await const MethodChannel('wxscan_live')
+          .invokeMethod<Map>('debugState');
+      if (!mounted) return;
+      setState(() => _native = Map<String, dynamic>.from(r ?? {}));
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _native = {'error': e.toString()});
+    }
   }
 
   @override
@@ -1334,35 +983,18 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
   }
 
   Future<void> _copy() async {
-    final s = widget.state;
-    final v = s._controller?.value;
     final b = StringBuffer();
     b.writeln('=== wxscan debug ===');
     b.writeln('generated: ${DateTime.now()}');
     b.writeln();
-    b.writeln('--- dart controller ---');
-    b.writeln('controller: ${s._controller == null ? "null" : "set"}');
-    if (v != null) {
-      b.writeln('nativeReady: ${v.nativeReady}');
-      b.writeln('previewSize: ${v.previewSize}');
-      b.writeln('torchEnabled: ${v.torchEnabled}');
-      b.writeln('zoom: ${v.zoom}');
-      b.writeln('resolution: ${v.resolution}');
+    b.writeln('--- native state ---');
+    for (final e in _native.entries) {
+      b.writeln('${e.key}: ${e.value}');
     }
     b.writeln();
-    b.writeln('--- dart stream ---');
-    b.writeln('rawFrameCount: ${s._rawFrameCount}');
-    b.writeln('lastFrameInfo: ${s._lastFrameInfo}');
-    b.writeln('nnEnabled: ${s._nnEnabled}');
-    b.writeln('weightsProblem: ${Scanner.weightsProblem}');
-    b.writeln();
-    b.writeln('--- current error ---');
-    b.writeln(s._error ?? '(none)');
-    b.writeln();
-    b.writeln('--- last log lines ---');
-    for (final line in s._logBuffer) {
-      b.writeln(line);
-    }
+    b.writeln('--- dart counters ---');
+    b.writeln('frames received: ${widget.state._rawFrameCount}');
+    b.writeln('last frame info: ${widget.state._lastFrameInfo}');
     await Clipboard.setData(ClipboardData(text: b.toString()));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -1370,10 +1002,43 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
     );
   }
 
+  String _formatName(int? f) {
+    switch (f) {
+      case 35:  return 'YUV_420_888  ✓ correct';
+      case 1:   return 'RGBA_8888   ✗ WRONG (4 bytes/px, Rust sees garbage)';
+      case 17:  return 'NV21        ✗ wrong (Y then VU interleaved)';
+      case 256: return 'JPEG        ✗ wrong';
+      case -1:  return '(no frame yet)';
+      default:  return 'unknown';
+    }
+  }
+
+  String _planesHint(int? planes) {
+    switch (planes) {
+      case 1: return '(1 = RGBA/NV21, wrong)';
+      case 3: return '(3 = YUV, correct)';
+      case null:
+      case 0: return '(no frame)';
+      default: return '(unexpected)';
+    }
+  }
+
+  String _pixelStrideHint(int? stride) {
+    switch (stride) {
+      case 1: return '(1 = Y-plane, correct)';
+      case 4: return '(4 = RGBA, wrong)';
+      case null:
+      case 0: return '(none)';
+      default: return '(unexpected)';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final s = widget.state;
     final v = s._controller?.value;
+    final fmt = _native['lastImageFormat'] as int?;
+
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
@@ -1414,8 +1079,50 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
                   'nnEnabled': s._nnEnabled,
                   'weightsProblem': Scanner.weightsProblem ?? '(none)',
                 }),
-                _section('DART: error', {
-                  'error': s._error ?? '(none)',
+                _section('NATIVE: frame format (ImageAnalysis output)', {
+                  'imageFormat':
+                      fmt != null ? '$fmt — ${_formatName(fmt)}' : '(none)',
+                  'planes count':
+                      '${_native['lastPlanesCount']} '
+                      '${_planesHint(_native['lastPlanesCount'] as int?)}',
+                  'pixelStride':
+                      '${_native['lastPixelStride']} '
+                      '${_pixelStrideHint(_native['lastPixelStride'] as int?)}',
+                  'rowStride': _native['lastRowStride'],
+                  'frame size':
+                      '${_native['lastFrameW']}x${_native['lastFrameH']}',
+                  'frame rotation': _native['lastFrameRot'],
+                }),
+                _section('NATIVE: scanner', {
+                  'modelsLoaded': _native['modelsLoaded'],
+                  'scannerHandle': _native['scannerHandle'],
+                  'busy': _native['busy'],
+                  'scanning': _native['scanning'],
+                  'bindCount': _native['bindCount'],
+                  'firstFrameReceived': _native['firstFrameReceived'],
+                }),
+                _section('NATIVE: pipeline', {
+                  'hasProvider': _native['hasProvider'],
+                  'hasCamera': _native['hasCamera'],
+                  'hasPreview': _native['hasPreview'],
+                  'hasAnalysis': _native['hasAnalysis'],
+                  'scanEnabled': _native['scanEnabled'],
+                  'desiredSize': _native['desiredSize'],
+                  'shortSide': _native['shortSide'],
+                  'targetShortSide': _native['targetShortSide'],
+                }),
+                _section('NATIVE: last frame buffer', {
+                  'size': '${_native['diagW']}x${_native['diagH']}',
+                  'stride': _native['diagStride'],
+                  'len': _native['diagLen'],
+                  'min/max/avg':
+                      '${_native['diagMin']} / ${_native['diagMax']} / '
+                      '${_native['diagAvg']}',
+                  'first16': _native['diagFirst16'],
+                  'frames seen': _native['diagFramesSeen'],
+                  'analyzed': _native['analyzedFrames'],
+                  'skipped': _native['skippedFrames'],
+                  'empty': _native['emptyFrames'],
                 }),
                 _section('DART: last 30 log lines', {
                   for (var i = 0; i < s._logBuffer.length; i++)
@@ -1423,11 +1130,14 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
                 }),
                 const SizedBox(height: 20),
                 const Text(
-                  'If rawFrameCount stays 0: frames are not arriving. '
-                  'setScanning(true) never reached the native side, or the '
-                  'driver refuses the resolution. If lastFrameInfo shows '
-                  '0x0: Huawei driver bug. If r=0 c=0: camera fine, detector '
-                  'sees nothing — check weightsProblem above.',
+                  'If imageFormat is 1 (RGBA_8888): the HAL ignored YUV, and '
+                  'Rust is reading 1/4 of the pixels as grayscale — the '
+                  'detector still finds a QR shape, the decoder cannot read '
+                  'it. That is the "candidates > 0, results = 0" symptom.\n\n'
+                  'If imageFormat is 35 (YUV_420_888), 3 planes, pixelStride '
+                  '1: format is correct. If results are still 0, the frame '
+                  'is fine and the decoder is the problem — try a larger QR, '
+                  'or switch to 1080p, or check that sr.tflite loaded.',
                   style: TextStyle(color: Colors.white54, fontSize: 11),
                 ),
               ],
@@ -1465,29 +1175,13 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
 }
 
 /// Holds the scanner to a phone-shaped panel on a screen too big for it.
-///
-/// Everything in the scanner is laid out against one box: the preview covers
-/// it, the viewfinder is drawn from its shortest side, and the markers and
-/// their hit-testing map frame coordinates onto it. So the whole stack is
-/// constrained together, never the preview alone — narrowing one layer and not
-/// the others would put the markers somewhere the codes are not.
-///
-/// A phone is left alone. A desktop window is not a phone: filling it would
-/// crop most of a 4:3 or 16:9 camera away and grow the viewfinder to the size
-/// of a dinner plate.
 class _Shell extends StatelessWidget {
   const _Shell({required this.child});
 
   final Widget child;
 
-  /// Below either of these the screen is a phone's, or a window small enough
-  /// to be treated as one. A phone in landscape is short, not large, which is
-  /// why the height has a say.
   static const double _wideEnough = 720;
   static const double _tallEnough = 600;
-
-  /// Width over height of the panel: a tall phone, which is the shape the
-  /// scanner was drawn for.
   static const double _panelAspect = 0.52;
 
   @override
@@ -1515,10 +1209,6 @@ class _Shell extends StatelessWidget {
 }
 
 /// A line of guidance over the camera picture.
-///
-/// It needs a ground of its own: bare text over a preview is legible against a
-/// wall and vanishes against anything busy, which is most of what a camera
-/// sees.
 class _Hint extends StatelessWidget {
   const _Hint(this.text);
 
@@ -1543,21 +1233,10 @@ class _Hint extends StatelessWidget {
   }
 }
 
-/// The viewfinder: four corners and a sweeping line.
 /// The four corners a camera draws where it was told to focus.
-///
-/// They come in wide and snap onto the point, then give one small pulse and
-/// fade. It is the only sign the tap was taken: focus itself is invisible on a
-/// code that was already sharp, and a tap that appears to do nothing reads as
-/// a tap that was missed.
-///
-/// Corners rather than a closed square because the point of the gesture is to
-/// say *there*, and an open shape leaves the thing being focused on visible
-/// through it.
 class _FocusReticle extends StatefulWidget {
   const _FocusReticle({required this.at});
 
-  /// Where the tap landed, in the shell's coordinates.
   final Offset at;
 
   @override
@@ -1566,8 +1245,6 @@ class _FocusReticle extends StatefulWidget {
 
 class _FocusReticleState extends State<_FocusReticle>
     with SingleTickerProviderStateMixin {
-  /// The square the corners sit on once settled. Big enough to frame a code,
-  /// small enough not to read as the viewfinder.
   static const double _size = 78;
 
   late final AnimationController _controller = AnimationController(
@@ -1578,8 +1255,6 @@ class _FocusReticleState extends State<_FocusReticle>
   @override
   void didUpdateWidget(_FocusReticle old) {
     super.didUpdateWidget(old);
-    // A second tap reuses this widget, so the animation is started again
-    // rather than sitting finished at the new place.
     if (widget.at != old.at) _controller.forward(from: 0);
   }
 
@@ -1589,14 +1264,11 @@ class _FocusReticleState extends State<_FocusReticle>
     super.dispose();
   }
 
-  /// Wide at first, onto the point by 260ms, then one pulse in and back.
   double _scaleAt(double t) {
     if (t < 0.24) {
       return 1.5 - 0.5 * Curves.easeOutCubic.transform(t / 0.24);
     }
     if (t < 0.46) {
-      // The pulse: in a little and out again, which is what says the camera
-      // acted rather than that the drawing merely arrived.
       final p = (t - 0.24) / 0.22;
       return 1.0 - 0.08 * math.sin(p * math.pi);
     }
@@ -1628,8 +1300,6 @@ class _FocusReticleState extends State<_FocusReticle>
                     scale: scale,
                     child: CustomPaint(
                       size: const Size(_size, _size),
-                      // The stroke is scaled the other way, so the lines keep
-                      // one weight however wide the corners are standing.
                       painter: _FocusCornersPainter(strokeScale: 1 / scale),
                     ),
                   ),
@@ -1643,7 +1313,6 @@ class _FocusReticleState extends State<_FocusReticle>
   }
 }
 
-/// Four L-shaped corners, drawn as one path so the joins are mitred.
 class _FocusCornersPainter extends CustomPainter {
   const _FocusCornersPainter({required this.strokeScale});
 
@@ -1651,7 +1320,6 @@ class _FocusCornersPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    // How far each arm runs along its edge.
     final arm = size.width * 0.28;
     final path = Path();
     for (final (cx, cy, sx, sy) in [
@@ -1683,12 +1351,6 @@ class _FocusCornersPainter extends CustomPainter {
 }
 
 /// The line that sweeps the picture, top to bottom, over and over.
-///
-/// There used to be a square viewfinder here, dimming everything outside
-/// itself. The scanner reads the whole frame, so the square was telling the
-/// user to aim at a region that was never the region being scanned, and the
-/// dimming hid the rest of a picture that was perfectly live. What is left is
-/// the one honest part: something is being looked at, and it is all of this.
 class _ScanLineOverlay extends StatefulWidget {
   const _ScanLineOverlay();
 
@@ -1732,16 +1394,11 @@ class _ScanLinePainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final y = size.height * progress;
 
-    // Faded in at the top and out at the bottom, so the return to the top
-    // reads as the sweep starting again rather than as the line jumping.
     final fade = math
         .min(progress / 0.12, (1 - progress) / 0.12)
         .clamp(0.0, 1.0);
     if (fade <= 0) return;
 
-    // A trail above the line, longer than a square's would have been: at the
-    // full height of a screen a bare rule reads as thin, and the trail is what
-    // gives the sweep a direction.
     final trail = math.min(size.height * 0.14, 150.0);
     final top = math.max(y - trail, 0.0);
     if (y > top) {
@@ -1760,8 +1417,6 @@ class _ScanLinePainter extends CustomPainter {
       );
     }
 
-    // The line itself, thinning towards the edges so it does not end in two
-    // hard stops against the sides of the screen.
     final line = Rect.fromLTWH(0, y - 1, size.width, 2);
     canvas.drawRect(
       line,
@@ -1848,10 +1503,6 @@ const Duration _kMultiCodeGrace = Duration(milliseconds: 700);
 
 /// A point of the scanned frame, as fractions of its width and height, in the
 /// coordinates `focusAt` takes.
-///
-/// The frame arrives upright with respect to the screen. The texture holds the
-/// picture upright with respect to the device, which is [quarterTurns]
-/// clockwise from it, so the point is turned back the other way.
 (double, double) _previewFraction(double fx, double fy, int quarterTurns) =>
     switch (quarterTurns) {
       1 => (fy, 1 - fx),
@@ -1861,10 +1512,6 @@ const Duration _kMultiCodeGrace = Duration(milliseconds: 700);
     };
 
 /// The mapping from frame coordinates to screen coordinates.
-///
-/// The preview fills its box with BoxFit.cover, so this works the same way.
-/// Drawing and hit-testing have to share one of these, or the markers drawn
-/// and the places that can actually be tapped drift apart.
 ({double scale, double dx, double dy}) _coverFit(Size size, int fw, int fh) {
   final scale = math.max(size.width / fw, size.height / fh);
   return (
@@ -1885,8 +1532,6 @@ class _CodeMarkerPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     if (frame.results.isEmpty || frame.width == 0 || frame.height == 0) return;
 
-    // The scanned frame's size can differ from the preview's, so the cover
-    // mapping applies, shared with hit-testing.
     final m = _coverFit(size, frame.width, frame.height);
     final scale = m.scale;
     final dx = m.dx;
@@ -1923,7 +1568,6 @@ class _CodeMarkerPainter extends CustomPainter {
           ..strokeWidth = 3
           ..style = PaintingStyle.stroke,
       );
-      // The centre point.
       final c = r.corners.centre;
       final cx = c.dx;
       final cy = c.dy;
