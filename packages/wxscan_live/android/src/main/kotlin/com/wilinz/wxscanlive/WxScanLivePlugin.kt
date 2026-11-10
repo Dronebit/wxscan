@@ -47,46 +47,33 @@ import java.util.concurrent.Executors
  * Preview → Flutter SurfaceTexture (GPU, no CPU per frame); ImageAnalysis →
  * Y plane → Rust over JNI.
  *
- * **This version follows the official CameraX QR-scanner sample as closely
- * as the Y-plane-to-Rust path allows.** Previous iterations added
- * ResolutionSelector + AspectRatioStrategy, UseCaseGroup + ViewPort,
- * CameraState.OPEN waits, two-step binds, warm/cold distinction, kick loops,
- * retry chains — all of it in an attempt to wake the analyser on Huawei.
- * The official sample has none of that: it binds Preview and ImageAnalysis
- * in one bindToLifecycle call with default settings, and it works. So this
- * file does the same and treats the Huawei issue, if it reappears, as a
- * fresh question rather than as something to pre-empt with machinery.
+ * This version follows the official CameraX QR-scanner sample as closely as
+ * the Y-plane-to-Rust path allows: one bindToLifecycle with default
+ * settings, no UseCaseGroup, no ViewPort, no CameraState waits, no
+ * warm/cold distinction, no retry chain, no kick loop. The only settings
+ * imposed on the use cases are setTargetResolution (deprecated, but the
+ * only size control the sample path offers) and setOutputImageFormat.
  *
- * What is taken from the sample verbatim:
+ * **setOutputImageFormat(YUV_420_888) is explicit, not left to default.**
  *
- *  * `Preview.Builder().build()` — no resolution, no rotation, no format.
- *  * `ImageAnalysis.Builder().setBackpressureStrategy(STRATEGY_KEEP_ONLY_LATEST).build()`
- *    — same, nothing else.
- *  * One `bindToLifecycle(lifecycle, selector, preview, analysis)`.
- *  * `CameraSelector.Builder().requireLensFacing(LENS_FACING_BACK).build()`.
- *  * `imageProxy.image` is inspected before anything else: null means the
- *    frame is not a YUV Image at all, and is closed and dropped.
+ * CameraX's default is YUV_420_888, but on Huawei HALs the default is not
+ * reliably honoured: with no format stated, the analyser has been observed
+ * to receive RGBA_8888 — one plane, four bytes per pixel, R G B A R G B A
+ * ... — and this file treats planes[0] as a grayscale Y plane. Fed RGBA as
+ * Y, the CNN detector still finds a QR-shaped pattern (it is trained on
+ * tolerant input), but the decoder cannot read it (it is strict). That is
+ * the "candidates > 0, results = 0" symptom: the frame arrives, something
+ * QR-like is detected, and no text comes out. Asking for YUV by name
+ * removes the ambiguity.
  *
- * What is added, because Rust needs a Y plane and the sample's MLKit path
- * does not:
- *
- *  * A Y-plane copy into a reused buffer, with row padding honoured.
- *  * `setTargetResolution(Size)` on both use cases — deprecated, but the
- *    only size control the sample's API surface offers, and what switches
- *    between 720p / 1080p / Max from Dart.
- *  * Downscale only if the HAL ignores the target and hands back something
- *    much bigger.
- *
- * `setResolution` re-binds with a new `setTargetResolution`. There is no
- * warm/cold distinction: every bind is the sample's single-step bind, and
- * if it fails the only thing that follows is a log line, not a retry loop.
- *
- * `kickStream` from the diagnostic panel does a plain `unbindAll` +
- * `bindToLifecycle` of the same use cases — the same operation the sample
- * performs on `openCamera()`, and the one the user found working by hand
- * when re-setting the resolution.
+ * Everything else stays as the sample has it: CameraSelector with
+ * requireLensFacing(BACK), one bindToLifecycle, imageProxy.image inspected
+ * before anything else.
  *
  * **Buffer caching.** [yBuf], [nv21Buf], [downscaleBuf] are reused.
+ *
+ * **Downscale** only if the HAL ignores the target and hands back something
+ * much bigger than asked.
  *
  * **try-catch(Throwable)** on every entry point. Does not catch a Rust
  * SIGABRT — nothing in Kotlin can.
@@ -622,8 +609,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
      * Binds Preview and ImageAnalysis in a single bindToLifecycle, the way
      * the official CameraX QR-scanner sample does. The only additions are
      * setTargetResolution (deprecated, but the only size control the sample
-     * path offers) and the surface-provider callback that copies the Y
-     * plane into [st] for Rust.
+     * path offers) and setOutputImageFormat, stated explicitly so the HAL
+     * does not quietly hand the analyser RGBA instead of YUV.
      */
     private fun bindUseCases(st: SurfaceTexture) {
         val provider = cameraProvider ?: return
@@ -666,6 +653,15 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         val analysisUseCase = ImageAnalysis.Builder()
             .setTargetResolution(desiredSize)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            // Explicit. CameraX's default is YUV_420_888, but on Huawei HALs
+            // the default is not reliably honoured: without a stated format
+            // the analyser has been observed to receive RGBA_8888 — one
+            // plane, four bytes per pixel — and this file treats planes[0]
+            // as a grayscale Y plane. Fed RGBA as Y, the detector still
+            // finds a QR-shaped pattern (tolerant), but the decoder cannot
+            // read it (strict), which is the "candidates > 0, results = 0"
+            // symptom. Asking for YUV by name removes the ambiguity.
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
         analysisUseCase.setAnalyzer(camExec, ::analyze)
         analysis = analysisUseCase
@@ -673,7 +669,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         android.util.Log.i(
             TAG,
             "bind #$bindCount: single bindToLifecycle(Preview, Analysis) " +
-            "at $desiredSize (target=$targetShortSide scanEnabled=$SCAN_ENABLED)",
+            "at $desiredSize format=YUV_420_888 " +
+            "(target=$targetShortSide scanEnabled=$SCAN_ENABLED)",
         )
 
         try {
