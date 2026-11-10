@@ -2,11 +2,12 @@ package com.wilinz.wxscanlive
 
 import android.Manifest
 import android.app.Activity
-import com.wilinz.wxscanlive.core.NativeScanner
+import android.app.Application
 import android.content.ComponentCallbacks
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Size
@@ -42,6 +43,7 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
+import com.wilinz.wxscanlive.core.NativeScanner
 import java.util.Locale
 import java.util.concurrent.Executors
 
@@ -57,26 +59,23 @@ import java.util.concurrent.Executors
  * caused by row padding (rowStride != width).
  *
  * **Throttle.** Submissions to Rust are rate-limited to one every 120 ms
- * (~8 fps), even when Rust is ready. A false candidate can make Rust spend
- * 300–500 ms on one frame; without this cap the next frame is submitted
- * immediately, and the analyser never leaves that state, dropping hundreds
- * of frames and making markers update in bursts.
+ * (~8 fps), even when Rust is ready.
  *
  * **Downscale.** Handled entirely in Rust (`jni_shim.rs` via a bilinear
- * resize). Kotlin passes the dense buffer as-is. Rust scales proportionally
- * if the frame exceeds its internal 1M px limit, and returns the downscaled
- * dimensions in the JSON, which Dart picks up automatically.
+ * resize). Kotlin passes the dense buffer as-is.
  *
- * **Watchdog.** If `busy` stays true for >5 s, it is reset. Protects against
- * a native hang in Rust.
+ * **Watchdog.** If `busy` stays true for >5 s, it is reset.
  *
  * **Lifecycle.** The plugin's own LifecycleRegistry follows the Activity:
- * CREATED while the activity is paused, RESUMED while visible. This is what
- * makes CameraX release the camera on background and reacquire it on return,
- * which is the fix for the "frozen preview after coming back from
- * background" symptom on this Huawei — the camera was never being released,
- * so the OS took it away without the plugin knowing, and on return there was
- * no open session to deliver frames from.
+ * CREATED while the activity is paused, RESUMED while visible. Activity
+ * pause/resume is observed through Application.ActivityLifecycleCallbacks,
+ * because ActivityPluginBinding in current Flutter does not provide
+ * addOnPauseListener / addOnResumeListener directly (that is in
+ * flutter_plugin_android_lifecycle, a dependency this plugin does not take).
+ * Making CameraX release the camera on background and reacquire it on return
+ * is the fix for "frozen preview after background" on Huawei — without it,
+ * the OS takes the camera away while the plugin still thinks the session
+ * is open, and on return no frames arrive at all.
  */
 class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     EventChannel.StreamHandler, ActivityAware, LifecycleOwner {
@@ -100,9 +99,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         private const val SCAN_ENABLED = true
         private const val DIAG_FRAMES = 5
 
-        /**
-         * Minimum gap between two submissions to Rust. 120 ms is ~8 fps.
-         */
         private const val MIN_SUBMIT_INTERVAL_MS = 120L
 
         private const val GATE_FALLBACK_MS = 3000L
@@ -122,11 +118,17 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     /**
      * Whether the activity is currently in the foreground. Set by the
-     * pause/resume listeners in [onAttachedToActivity]; used to decide
-     * whether a frame that arrives after a rebind is expected or is a
-     * leftover from before the pause.
+     * pause/resume listeners; used to decide whether a frame that arrives
+     * after a rebind is expected or is a leftover from before the pause.
      */
     @Volatile private var activityResumed = false
+
+    /**
+     * Observes pause/resume of the hosting Activity. Registered on
+     * onAttachedToActivity, removed in onDetachedFromActivity and teardown.
+     * Null while no activity is attached.
+     */
+    private var activityLifecycleCallbacks: Application.ActivityLifecycleCallbacks? = null
 
     private val main = Handler(Looper.getMainLooper())
 
@@ -264,31 +266,67 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         activity = binding.activity
         activityResumed = true
-        binding.addOnPauseListener { handleActivityPaused() }
-        binding.addOnResumeListener { handleActivityResumed() }
+        registerActivityLifecycleCallbacks()
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
         activityResumed = false
+        unregisterActivityLifecycleCallbacks()
         handleActivityPaused()
     }
 
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
         activity = binding.activity
         activityResumed = true
-        binding.addOnPauseListener { handleActivityPaused() }
-        binding.addOnResumeListener { handleActivityResumed() }
+        registerActivityLifecycleCallbacks()
         handleActivityResumed()
     }
 
     override fun onDetachedFromActivity() {
         activity = null
         activityResumed = false
+        unregisterActivityLifecycleCallbacks()
         handleActivityPaused()
     }
 
-    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) { scanSink = events }
-    override fun onCancel(arguments: Any?) { scanSink = null }
+    private fun registerActivityLifecycleCallbacks() {
+        unregisterActivityLifecycleCallbacks()
+        val app = activity?.application ?: return
+        val callbacks = object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityResumed(a: Activity) {
+                if (a === activity) handleActivityResumed()
+            }
+
+            override fun onActivityPaused(a: Activity) {
+                if (a === activity) handleActivityPaused()
+            }
+
+            override fun onActivityCreated(a: Activity, b: Bundle?) {}
+            override fun onActivityStarted(a: Activity) {}
+            override fun onActivityStopped(a: Activity) {}
+            override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
+            override fun onActivityDestroyed(a: Activity) {}
+        }
+        activityLifecycleCallbacks = callbacks
+        app.registerActivityLifecycleCallbacks(callbacks)
+    }
+
+    private fun unregisterActivityLifecycleCallbacks() {
+        val cb = activityLifecycleCallbacks ?: return
+        activityLifecycleCallbacks = null
+        try {
+            activity?.application?.unregisterActivityLifecycleCallbacks(cb)
+        } catch (_: Throwable) {
+        }
+    }
+
+    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+        scanSink = events
+    }
+
+    override fun onCancel(arguments: Any?) {
+        scanSink = null
+    }
 
     // ---------- MethodChannel ----------
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -390,7 +428,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             firstFrameReceived = false
                             shortSide = targetShortSide
                             rebindUseCases()
-                        } catch (_: Throwable) {}
+                        } catch (_: Throwable) {
+                        }
                     }
                     result.success(null)
                 }
@@ -471,8 +510,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             }
                             val t0 = android.os.SystemClock.elapsedRealtime()
                             val json = try {
-                                NativeScanner.scanFrame(scannerHandle, padded, w, h, stride, rot, false)
-                            } catch (e: Throwable) { "ERR ${e.message}" }
+                                NativeScanner.scanFrame(
+                                    scannerHandle, padded, w, h, stride, rot, false,
+                                )
+                            } catch (e: Throwable) {
+                                "ERR ${e.message}"
+                            }
                             val dt = android.os.SystemClock.elapsedRealtime() - t0
                             android.util.Log.i(TAG, "selfTestNative rot=$rot ${dt}ms -> $json")
                             main.post { result.success(json) }
@@ -491,7 +534,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             }
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "onMethodCall(${call.method}) failed", e)
-            try { result.error("PLUGIN_ERROR", e.message, null) } catch (_: Throwable) {}
+            try {
+                result.error("PLUGIN_ERROR", e.message, null)
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -514,15 +560,20 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 if (scannerHandle != 0L) {
                     modelsLoaded = try {
                         NativeScanner.hasDetector(scannerHandle)
-                    } catch (_: Throwable) { false }
+                    } catch (_: Throwable) {
+                        false
+                    }
                     return
                 }
             }
             val empty = ByteArray(0)
             val fromPaths = detectPath != null || srPath != null
             scannerHandle = try {
-                val h = if (fromPaths) NativeScanner.createFromPaths(detectPath, srPath)
-                        else NativeScanner.create(detect ?: empty, sr ?: empty)
+                val h = if (fromPaths) {
+                    NativeScanner.createFromPaths(detectPath, srPath)
+                } else {
+                    NativeScanner.create(detect ?: empty, sr ?: empty)
+                }
                 android.util.Log.i(TAG, "scanner created: handle=$h paths=$fromPaths")
                 h
             } catch (e: Throwable) {
@@ -553,7 +604,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             val h = scannerHandle
             scannerHandle = 0L
             modelsLoaded = false
-            worker.execute { try { NativeScanner.release(h) } catch (_: Throwable) {} }
+            worker.execute {
+                try {
+                    NativeScanner.release(h)
+                } catch (_: Throwable) {
+                }
+            }
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "releaseScanner failed", e)
         }
@@ -580,15 +636,22 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 return
             }
             main.post {
-                try { bindCamera(result, detect, sr, detectPath, srPath, borrowed) }
-                catch (e: Throwable) {
+                try {
+                    bindCamera(result, detect, sr, detectPath, srPath, borrowed)
+                } catch (e: Throwable) {
                     android.util.Log.e(TAG, "bindCamera failed", e)
-                    try { result.error("INIT_ERROR", e.message, null) } catch (_: Throwable) {}
+                    try {
+                        result.error("INIT_ERROR", e.message, null)
+                    } catch (_: Throwable) {
+                    }
                 }
             }
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "handleInitialize failed", e)
-            try { result.error("INIT_ERROR", e.message, null) } catch (_: Throwable) {}
+            try {
+                result.error("INIT_ERROR", e.message, null)
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -599,7 +662,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         "previewHeight" to previewH,
         "displayRotation" to displayRotationDegrees,
         "nativeReady" to nativeReady,
-        "modelsLoaded" to modelsLoaded
+        "modelsLoaded" to modelsLoaded,
     )
 
     private fun bindCamera(
@@ -616,7 +679,9 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 sessionId = ++lastSessionId
                 ensureScanner(detect, sr, detectPath, srPath, borrowed)
                 if (shortSide != boundShortSide) {
-                    try { rebindUseCases() } catch (e: Throwable) {
+                    try {
+                        rebindUseCases()
+                    } catch (e: Throwable) {
                         android.util.Log.e(TAG, "rebind on takeover failed", e)
                     }
                 }
@@ -633,7 +698,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             ensureScanner(detect, sr, detectPath, srPath, borrowed)
             starting = true
             lifecycleRegistry.currentState = Lifecycle.State.RESUMED
-            textureEntry?.let { try { it.release() } catch (_: Throwable) {} }
+            textureEntry?.let {
+                try {
+                    it.release()
+                } catch (_: Throwable) {
+                }
+            }
             val entry = textureRegistry.createSurfaceTexture()
             textureEntry = entry
             val st: SurfaceTexture = entry.surfaceTexture()
@@ -642,7 +712,11 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             future.addListener({
                 try {
                     if (!starting) {
-                        result.error("CANCELLED", "the camera was disposed while starting", null)
+                        result.error(
+                            "CANCELLED",
+                            "the camera was disposed while starting",
+                            null,
+                        )
                         return@addListener
                     }
                     try {
@@ -693,7 +767,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 android.util.Log.i(
                     TAG,
                     "surface request ${res.width}x${res.height} " +
-                    "(current buf=${bufW}x$bufH)"
+                    "(current buf=${bufW}x$bufH)",
                 )
                 st.setDefaultBufferSize(res.width, res.height)
                 bufW = res.width
@@ -702,7 +776,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 previewSurface = surface
                 recomputePreviewSize()
                 request.provideSurface(surface, ContextCompat.getMainExecutor(appContext)) {
-                    try { surface.release() } catch (_: Throwable) {}
+                    try {
+                        surface.release()
+                    } catch (_: Throwable) {
+                    }
                 }
             } catch (e: Throwable) {
                 android.util.Log.e(TAG, "surfaceProvider failed", e)
@@ -722,12 +799,12 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         android.util.Log.i(
             TAG,
             "bind #$bindCount: single bindToLifecycle(Preview, Analysis) " +
-            "at $desiredSize (gate waits for CameraState.OPEN)"
+            "at $desiredSize (gate waits for CameraState.OPEN)",
         )
 
         try {
             camera = provider.bindToLifecycle(
-                this, selector, previewUseCase, analysisUseCase
+                this, selector, previewUseCase, analysisUseCase,
             )
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "bindToLifecycle failed", e)
@@ -736,7 +813,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         startOrientationListener()
         previewUseCase.resolutionInfo?.resolution?.let {
-            bufW = it.width; bufH = it.height
+            bufW = it.width
+            bufH = it.height
         }
         analysisUseCase.resolutionInfo?.resolution?.let {
             android.util.Log.i(TAG, "analysis resolved to ${it.width}x${it.height}")
@@ -776,7 +854,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         try {
             android.util.Log.i(
                 TAG,
-                "activity paused (resumed=$activityResumed) — releasing camera"
+                "activity paused (resumed=$activityResumed) — releasing camera",
             )
             cancelGateFallback()
             cancelAutoRebind()
@@ -804,7 +882,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         try {
             android.util.Log.i(
                 TAG,
-                "activity resumed — reacquiring camera (bindCount=$bindCount)"
+                "activity resumed — reacquiring camera (bindCount=$bindCount)",
             )
             if (lifecycleRegistry.currentState.isAtLeast(Lifecycle.State.CREATED)) {
                 lifecycleRegistry.currentState = Lifecycle.State.RESUMED
@@ -826,7 +904,11 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         val cam = camera ?: return
         val observer = object : Observer<CameraState> {
             override fun onChanged(state: CameraState) {
-                val type = try { state.type.name } catch (_: Throwable) { "?" }
+                val type = try {
+                    state.type.name
+                } catch (_: Throwable) {
+                    "?"
+                }
                 cameraStateType = type
                 android.util.Log.i(TAG, "[$label] CameraState: $type")
                 if (state.type == CameraState.Type.OPEN && !cameraIsReady) {
@@ -835,7 +917,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.i(
                         TAG,
                         "[$label] OPEN — gate opened, frames now reach Rust " +
-                        "(preOpenFrames=$preOpenFrames)"
+                        "(preOpenFrames=$preOpenFrames)",
                     )
                 }
             }
@@ -851,7 +933,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private fun unwatchCameraState() {
         cameraStateObserver?.let { obs ->
-            try { camera?.cameraInfo?.cameraState?.removeObserver(obs) } catch (_: Throwable) {}
+            try {
+                camera?.cameraInfo?.cameraState?.removeObserver(obs)
+            } catch (_: Throwable) {
+            }
         }
         cameraStateObserver = null
     }
@@ -865,7 +950,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.w(
                         TAG,
                         "CameraState.OPEN not reached in ${GATE_FALLBACK_MS}ms " +
-                        "(last=$cameraStateType) — forcing gate open"
+                        "(last=$cameraStateType) — forcing gate open",
                     )
                 }
             } catch (e: Throwable) {
@@ -895,7 +980,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     TAG,
                     "auto-rebind: no valid frame in ${AUTO_REBIND_MS}ms, " +
                     "rebinding once (cameraIsReady=$cameraIsReady " +
-                    "state=$cameraStateType preOpen=$preOpenFrames)"
+                    "state=$cameraStateType preOpen=$preOpenFrames)",
                 )
                 bindUseCases(st)
             } catch (e: Throwable) {
@@ -915,7 +1000,9 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         try {
             @Suppress("DEPRECATION")
             activity?.windowManager?.defaultDisplay?.rotation ?: Surface.ROTATION_0
-        } catch (_: Throwable) { Surface.ROTATION_0 }
+        } catch (_: Throwable) {
+            Surface.ROTATION_0
+        }
 
     private fun startOrientationListener() {
         try {
@@ -923,15 +1010,24 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             orientationListener?.disable()
             orientationListener = object : OrientationEventListener(ctx) {
                 override fun onOrientationChanged(orientation: Int) {
-                    try { scheduleRotationCheck() } catch (_: Throwable) {}
+                    try {
+                        scheduleRotationCheck()
+                    } catch (_: Throwable) {
+                    }
                 }
-            }.apply { if (canDetectOrientation()) enable() }
+            }.apply {
+                if (canDetectOrientation()) enable()
+            }
 
             configCallback?.let { activity?.unregisterComponentCallbacks(it) }
             configCallback = object : ComponentCallbacks {
                 override fun onConfigurationChanged(newConfig: Configuration) {
-                    try { scheduleRotationCheck() } catch (_: Throwable) {}
+                    try {
+                        scheduleRotationCheck()
+                    } catch (_: Throwable) {
+                    }
                 }
+
                 override fun onLowMemory() {}
             }
             @Suppress("DEPRECATION")
@@ -973,11 +1069,17 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         val ctx = activity ?: appContext
         return when (ctx.resources.configuration.orientation) {
             Configuration.ORIENTATION_PORTRAIT ->
-                if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_90)
-                    Surface.ROTATION_0 else Surface.ROTATION_180
+                if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_90) {
+                    Surface.ROTATION_0
+                } else {
+                    Surface.ROTATION_180
+                }
             Configuration.ORIENTATION_LANDSCAPE ->
-                if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_90)
-                    Surface.ROTATION_90 else Surface.ROTATION_270
+                if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_90) {
+                    Surface.ROTATION_90
+                } else {
+                    Surface.ROTATION_270
+                }
             else -> Surface.ROTATION_0
         }
     }
@@ -992,7 +1094,9 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     private fun recomputePreviewSize() {
         val sensor = try {
             camera?.cameraInfo?.sensorRotationDegrees ?: 90
-        } catch (_: Throwable) { 90 }
+        } catch (_: Throwable) {
+            90
+        }
         val rot = ((sensor % 360) + 360) % 360
         val w = if (rot % 180 == 0) bufW else bufH
         val h = if (rot % 180 == 0) bufH else bufW
@@ -1004,7 +1108,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     }
 
     private fun pushPreviewSize() {
-        try { sizeHandler.sink?.success(previewSizeMap()) } catch (_: Throwable) {}
+        try {
+            sizeHandler.sink?.success(previewSizeMap())
+        } catch (_: Throwable) {
+        }
     }
 
     private fun focusAt(x: Double, y: Double): Boolean {
@@ -1021,7 +1128,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 .createPoint(bx.toFloat(), by.toFloat())
             val action = FocusMeteringAction.Builder(
                 point,
-                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE,
             ).build()
             if (!cam.cameraInfo.isFocusMeteringSupported(action)) return false
             cam.cameraControl.startFocusAndMetering(action)
@@ -1035,16 +1142,22 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     private fun previewSizeMap(): Map<String, Any> = mapOf(
         "width" to previewW,
         "height" to previewH,
-        "displayRotation" to displayRotationDegrees
+        "displayRotation" to displayRotationDegrees,
     )
 
     private val sizeHandler = object : EventChannel.StreamHandler {
         @Volatile var sink: EventChannel.EventSink? = null
         override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
             sink = events
-            try { events?.success(previewSizeMap()) } catch (_: Throwable) {}
+            try {
+                events?.success(previewSizeMap())
+            } catch (_: Throwable) {
+            }
         }
-        override fun onCancel(arguments: Any?) { sink = null }
+
+        override fun onCancel(arguments: Any?) {
+            sink = null
+        }
     }
 
     private fun ensureYBuffer(size: Int): ByteArray {
@@ -1178,7 +1291,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 android.util.Log.w(
                     TAG,
                     "watchdog: busy stuck for " +
-                    "${System.currentTimeMillis() - busyStartedAt}ms, resetting"
+                    "${System.currentTimeMillis() - busyStartedAt}ms, resetting",
                 )
                 busy = false
             }
@@ -1190,10 +1303,13 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         TAG,
                         "frame #$preOpenFrames before OPEN " +
                         "(state=$cameraStateType, " +
-                        "size=${image.width}x${image.height}) — skipped"
+                        "size=${image.width}x${image.height}) — skipped",
                     )
                 }
-                try { image.close() } catch (_: Throwable) {}
+                try {
+                    image.close()
+                } catch (_: Throwable) {
+                }
                 return
             }
 
@@ -1204,10 +1320,13 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.w(
                         TAG,
                         "empty #$emptyFrames: image.image == null " +
-                        "(format=${image.format} planes=${image.planes.size})"
+                        "(format=${image.format} planes=${image.planes.size})",
                     )
                 }
-                try { image.close() } catch (_: Throwable) {}
+                try {
+                    image.close()
+                } catch (_: Throwable) {
+                }
                 return
             }
 
@@ -1217,10 +1336,13 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.w(
                         TAG,
                         "empty #$emptyFrames: ${image.width}x${image.height} " +
-                        "format=${image.format} shortSide=$shortSide"
+                        "format=${image.format} shortSide=$shortSide",
                     )
                 }
-                try { image.close() } catch (_: Throwable) {}
+                try {
+                    image.close()
+                } catch (_: Throwable) {
+                }
                 return
             }
             if (emptyFrames > 0) {
@@ -1231,24 +1353,31 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             if (image.planes.isEmpty()) {
                 android.util.Log.w(
                     TAG,
-                    "planes empty — format=${image.format} size=${image.width}x${image.height}"
+                    "planes empty — format=${image.format} size=${image.width}x${image.height}",
                 )
-                try { image.close() } catch (_: Throwable) {}
+                try {
+                    image.close()
+                } catch (_: Throwable) {
+                }
                 return
             }
 
             val now = System.currentTimeMillis()
             if (!scanning || !nativeReady || scannerHandle == 0L || busy ||
-                now - lastSubmitAt < MIN_SUBMIT_INTERVAL_MS) {
+                now - lastSubmitAt < MIN_SUBMIT_INTERVAL_MS
+            ) {
                 if (skippedFrames++ % 60 == 0L) {
                     android.util.Log.i(
                         TAG,
                         "frame skipped: busy=$busy " +
                         "sinceLastSubmit=${now - lastSubmitAt}ms " +
-                        "format=${image.format} size=${image.width}x${image.height}"
+                        "format=${image.format} size=${image.width}x${image.height}",
                     )
                 }
-                try { image.close() } catch (_: Throwable) {}
+                try {
+                    image.close()
+                } catch (_: Throwable) {
+                }
                 return
             }
 
@@ -1259,7 +1388,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     "first valid frame arrived (${image.width}x${image.height} " +
                     "rot=${image.imageInfo.rotationDegrees}) — " +
                     "target=$targetShortSide current=$shortSide " +
-                    "state=$cameraStateType"
+                    "state=$cameraStateType",
                 )
             }
 
@@ -1281,7 +1410,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     "plane0: rowStride=${p0?.rowStride} " +
                     "pixelStride=${p0?.pixelStride} " +
                     "bytes=${p0?.buffer?.remaining()} " +
-                    "stride*height=${(p0?.rowStride ?: 0).toLong() * image.height}"
+                    "stride*height=${(p0?.rowStride ?: 0).toLong() * image.height}",
                 )
             }
 
@@ -1291,7 +1420,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
             val copied = copyYPlane(image)
             if (copied == null) {
-                try { image.close() } catch (_: Throwable) {}
+                try {
+                    image.close()
+                } catch (_: Throwable) {
+                }
                 return
             }
             val (y, yLen, rowStride) = copied
@@ -1308,14 +1440,17 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.w(
                         TAG,
                         "nv21 err (grabFrame disabled): ${e.message} " +
-                        "format=${image.format} planes=${image.planes.size}"
+                        "format=${image.format} planes=${image.planes.size}",
                     )
                     lastNv21 = null
                     needNv21 = false
                 }
             }
 
-            try { image.close() } catch (_: Throwable) {}
+            try {
+                image.close()
+            } catch (_: Throwable) {
+            }
 
             val stats = measureYPlane(y, w, h, rowStride)
             diagW = w
@@ -1334,7 +1469,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     "len=$yLen stride*height=${rowStride.toLong() * h} " +
                     "min=${stats.first} max=${stats.second} " +
                     "avg=${String.format(Locale.US, "%.1f", stats.third)} " +
-                    "first16=$diagFirst16"
+                    "first16=$diagFirst16",
                 )
             }
 
@@ -1364,7 +1499,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         TAG,
                         "repacked ${w}x$h: yLen=$yLen " +
                         "(stride=$rowStride, stride*height=${rowStride.toLong() * h}) " +
-                        "-> dense (${needed} bytes)"
+                        "-> dense (${needed} bytes)",
                     )
                 }
             }
@@ -1380,7 +1515,10 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             }
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "analyze failed: ${e.message}", e)
-            try { image.close() } catch (_: Throwable) {}
+            try {
+                image.close()
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -1396,7 +1534,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     android.util.Log.i(
                         TAG,
                         "scan #$firstNScans: ${w}x$h rot=$rot stride=$rowStride " +
-                        "yLen=${y.size} dt=${dt}ms json='${json.take(200)}'"
+                        "yLen=${y.size} dt=${dt}ms json='${json.take(200)}'",
                     )
                 }
 
@@ -1407,12 +1545,19 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     val n = statFrames
                     android.util.Log.i(
                         TAG,
-                        "scan ${statTotalMs / n}ms avg / ${statMaxMs}ms max (${w}x$h rot=$rot)"
+                        "scan ${statTotalMs / n}ms avg / ${statMaxMs}ms max (${w}x$h rot=$rot)",
                     )
-                    statFrames = 0; statTotalMs = 0; statMaxMs = 0
+                    statFrames = 0
+                    statTotalMs = 0
+                    statMaxMs = 0
                 }
 
-                main.post { try { scanSink?.success(json) } catch (_: Throwable) {} }
+                main.post {
+                    try {
+                        scanSink?.success(json)
+                    } catch (_: Throwable) {
+                    }
+                }
             } catch (e: Throwable) {
                 android.util.Log.e(TAG, "scan err: ${e.message}")
             } finally {
@@ -1423,6 +1568,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private fun teardown() {
         try {
+            unregisterActivityLifecycleCallbacks()
             cancelGateFallback()
             cancelAutoRebind()
             unwatchCameraState()
@@ -1441,12 +1587,21 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             main.removeCallbacks(rotationCheck)
             preview = null
             analysis = null
-            try { cameraProvider?.unbindAll() } catch (_: Throwable) {}
+            try {
+                cameraProvider?.unbindAll()
+            } catch (_: Throwable) {
+            }
             cameraProvider = null
             camera = null
-            try { previewSurface?.release() } catch (_: Throwable) {}
+            try {
+                previewSurface?.release()
+            } catch (_: Throwable) {
+            }
             previewSurface = null
-            try { textureEntry?.release() } catch (_: Throwable) {}
+            try {
+                textureEntry?.release()
+            } catch (_: Throwable) {
+            }
             textureEntry = null
             if (lifecycleRegistry.currentState.isAtLeast(Lifecycle.State.CREATED)) {
                 lifecycleRegistry.currentState = Lifecycle.State.CREATED
