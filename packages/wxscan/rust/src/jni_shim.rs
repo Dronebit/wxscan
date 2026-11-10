@@ -11,8 +11,6 @@
 //! Serialization therefore lives here, in the binding layer, rather than in the
 //! C ABI.
 
-use image::imageops::{self, FilterType};
-use image::GrayImage;
 use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
@@ -30,18 +28,14 @@ use wxscan_ffi::WxScanScannerId;
 /// ten frames in a row, and the UI freezes between marker updates.
 ///
 /// 1 million pixels is roughly 1000x1000, plenty for a QR code and ~3x less
-/// work than 1728x1728. Reduce to 640*640 if the detector inside
-/// `scan_upright` turns out to work on 640x640 — that would make the resize
-/// here the only one, with no second pass inside.
+/// work than 1728x1728. If `scan_upright` inside the upstream `wxscan`
+/// crate turns out to resize to its own input shape (e.g. 640x640 for a
+/// YOLO-nano detector), then this value should be set to match, so the two
+/// resizes collapse into one.
 const MAX_INPUT_PIXELS: usize = 1_000_000;
 
 /// Downscales a dense grayscale frame proportionally if it exceeds
 /// [MAX_INPUT_PIXELS].
-///
-/// Uses `image`'s bilinear filter ([FilterType::Triangle]), which preserves
-/// QR module edges well enough and is fast on ARM. Lanczos3 would be sharper
-/// but noticeably slower; Nearest would be faster but blockier, and a QR code
-/// rewards clean edges.
 ///
 /// The buffer must be exactly `w * h` bytes — the shape [upright_gray] is
 /// contracted to produce. Anything else comes back as an empty buffer with
@@ -61,15 +55,83 @@ fn maybe_downscale(gray: Vec<u8>, w: usize, h: usize) -> (Vec<u8>, usize, usize)
     }
 
     let scale = (MAX_INPUT_PIXELS as f64 / (w * h) as f64).sqrt();
-    let dst_w = ((w as f64 * scale).round() as u32).max(1);
-    let dst_h = ((h as f64 * scale).round() as u32).max(1);
+    let dst_w = ((w as f64 * scale).round() as usize).max(1);
+    let dst_h = ((h as f64 * scale).round() as usize).max(1);
 
-    let img: GrayImage = match image::ImageBuffer::from_raw(w as u32, h as u32, gray) {
-        Some(img) => img,
-        None => return (Vec::new(), 0, 0),
-    };
-    let resized = imageops::resize(&img, dst_w, dst_h, FilterType::Triangle);
-    (resized.into_raw(), dst_w as usize, dst_h as usize)
+    let resized = bilinear_resize(&gray, w, h, dst_w, dst_h);
+    (resized, dst_w, dst_h)
+}
+
+/// Bilinear downscale with center-aligned sampling.
+///
+/// Center-aligned: dst pixel `dx` samples src at `(dx + 0.5) * src_w/dst_w - 0.5`.
+/// This avoids aliasing (skipping source rows, which corner-aligned mapping
+/// introduces on downscale) and matches what `image::imageops::resize` does
+/// with `FilterType::Triangle`.
+///
+/// f32 rather than f64: on ARM f64 arithmetic is slower, and f32 precision
+/// (24 bits of mantissa) is more than enough for a 0–255 intensity range
+/// with a 4-tap bilinear kernel.
+///
+/// No SIMD. A QR code is scanned at ≤ 8 fps (the camera side's throttle), so
+/// 3–10 ms for a 3M-pixel frame is invisible — the CNN takes 60–80 ms for
+/// the same frame regardless.
+fn bilinear_resize(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; dst_w * dst_h];
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return dst;
+    }
+    let x_ratio = src_w as f32 / dst_w as f32;
+    let y_ratio = src_h as f32 / dst_h as f32;
+    let last_x = src_w - 1;
+    let last_y = src_h - 1;
+
+    for dy in 0..dst_h {
+        let sy = (dy as f32 + 0.5) * y_ratio - 0.5;
+        let (y0, fy) = if sy <= 0.0 {
+            (0usize, 0.0f32)
+        } else if sy >= last_y as f32 {
+            (last_y, 0.0f32)
+        } else {
+            let y = sy as usize;
+            (y, sy - y as f32)
+        };
+        let y1 = (y0 + 1).min(last_y);
+        let row0 = y0 * src_w;
+        let row1 = y1 * src_w;
+
+        for dx in 0..dst_w {
+            let sx = (dx as f32 + 0.5) * x_ratio - 0.5;
+            let (x0, fx) = if sx <= 0.0 {
+                (0usize, 0.0f32)
+            } else if sx >= last_x as f32 {
+                (last_x, 0.0f32)
+            } else {
+                let x = sx as usize;
+                (x, sx - x as f32)
+            };
+            let x1 = (x0 + 1).min(last_x);
+
+            let v00 = src[row0 + x0] as f32;
+            let v01 = src[row0 + x1] as f32;
+            let v10 = src[row1 + x0] as f32;
+            let v11 = src[row1 + x1] as f32;
+
+            let v = v00 * (1.0 - fx) * (1.0 - fy)
+                + v01 * fx * (1.0 - fy)
+                + v10 * (1.0 - fx) * fy
+                + v11 * fx * fy;
+
+            dst[dy * dst_w + dx] = v.round() as u8;
+        }
+    }
+    dst
 }
 
 /// A `jlong` as a handle, or 0 if it cannot be one.
