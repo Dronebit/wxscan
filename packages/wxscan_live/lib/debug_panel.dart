@@ -1,20 +1,8 @@
-/// A phone-only diagnostic panel. Opens from the scanner's bug button,
-/// shows everything Dart and the native side are willing to say, and can
-/// copy the lot to the clipboard for sending on — no file, no external
-/// dependencies.
-import 'dart:async';
-
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:wxscan_live/wxscan_live.dart';
-
-const _channel = MethodChannel('wxscan_live');
-
-/// Diagnostic panel that opens from the scanner's bug button. Shows Dart-
-/// side counters, the native state map, and the last dozen log lines,
-/// refreshed every 700 ms. No native calls of its own — it reads the same
-/// `debugState` the plugin exposes — so it works even when the native layer
-/// is dead.
+/// Diagnostic panel that opens from the scanner's bug button. Reads the
+/// plugin's `debugState` map every 700 ms and renders it grouped by what it
+/// answers: what the controller thinks, what the analyser is receiving,
+/// what the scanner is doing. No native calls of its own — it works even
+/// when the native layer is dead.
 class _DebugPanelPage extends StatefulWidget {
   final _ScanPageState state;
   const _DebugPanelPage({required this.state});
@@ -79,12 +67,46 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
   /// scanner wants (YUV_420_888, three planes, pixelStride 1).
   String _formatName(int? f) {
     switch (f) {
-      case 35:  return 'YUV_420_888  ✓ correct';
-      case 1:   return 'RGBA_8888   ✗ WRONG (4 bytes/px, Rust sees garbage)';
-      case 17:  return 'NV21        ✗ wrong (Y then VU interleaved)';
-      case 256: return 'JPEG        ✗ wrong';
-      case -1:  return '(no frame yet)';
-      default:  return 'unknown';
+      case 35:
+        return 'YUV_420_888  ✓ correct';
+      case 1:
+        return 'RGBA_8888   ✗ WRONG (4 bytes/px, Rust sees garbage)';
+      case 17:
+        return 'NV21        ✗ wrong (Y then VU interleaved)';
+      case 256:
+        return 'JPEG        ✗ wrong';
+      case -1:
+        return '(no frame yet)';
+      default:
+        return 'unknown';
+    }
+  }
+
+  String _planesHint(int? planes) {
+    switch (planes) {
+      case 1:
+        return '(1 = RGBA/NV21, wrong)';
+      case 3:
+        return '(3 = YUV, correct)';
+      case null:
+      case 0:
+        return '(no frame)';
+      default:
+        return '(unexpected)';
+    }
+  }
+
+  String _pixelStrideHint(int? stride) {
+    switch (stride) {
+      case 1:
+        return '(1 = Y-plane, correct)';
+      case 4:
+        return '(4 = RGBA, wrong)';
+      case null:
+      case 0:
+        return '(none)';
+      default:
+        return '(unexpected)';
     }
   }
 
@@ -134,7 +156,8 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
 
                 // ---- NEW: what the analyser is actually receiving ----
                 _section('NATIVE: frame format (ImageAnalysis output)', {
-                  'imageFormat': fmt != null ? '$fmt — ${_formatName(fmt)}' : '(none)',
+                  'imageFormat':
+                      fmt != null ? '$fmt — ${_formatName(fmt)}' : '(none)',
                   'planes count':
                       '${native['lastPlanesCount']} '
                       '${_planesHint(native['lastPlanesCount'] as int?)}',
@@ -153,6 +176,7 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
                   'busy': native['busy'],
                   'scanning': native['scanning'],
                   'bindCount': native['bindCount'],
+                  'boundExplicitResolution': native['boundExplicitResolution'],
                   'firstFrameReceived': native['firstFrameReceived'],
                 }),
                 _section('NATIVE: pipeline', {
@@ -177,6 +201,9 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
                   'analyzed': native['analyzedFrames'],
                   'skipped': native['skippedFrames'],
                   'empty': native['emptyFrames'],
+                  'yBufCached': native['yBufCached'],
+                  'nv21BufCached': native['nv21BufCached'],
+                  'downscaleBufCached': native['downscaleBufCached'],
                 }),
                 _section('DART: last 30 log lines', {
                   for (var i = 0; i < widget.state._logBuffer.length; i++)
@@ -184,12 +211,14 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
                 }),
                 const SizedBox(height: 20),
                 const Text(
-                  'If imageFormat is 1 (RGBA_8888): the HAL ignored the '
-                  'requested YUV format. Rust is reading 1/4 of the pixels as '
-                  'if they were grayscale — the detector still finds a QR '
-                  'shape, but the decoder cannot read it. That is the '
-                  '"candidates > 0, results = 0" symptom. Need to convert '
-                  'RGBA→Y in Kotlin, or find a CameraX setting the HAL obeys.',
+                  'If imageFormat is 1 (RGBA_8888): the HAL ignored YUV, and '
+                  'Rust is reading 1/4 of the pixels as grayscale — the '
+                  'detector still finds a QR shape, the decoder cannot read '
+                  'it. That is the "candidates > 0, results = 0" symptom.\n\n'
+                  'If imageFormat is 35 (YUV_420_888), 3 planes, pixelStride '
+                  '1: format is correct. If results are still 0, the frame '
+                  'is fine and the decoder is the problem — try a larger QR, '
+                  'or switch to 1080p, or check that sr.tflite loaded.',
                   style: TextStyle(color: Colors.white54, fontSize: 11),
                 ),
               ],
@@ -198,28 +227,6 @@ class _DebugPanelPageState extends State<_DebugPanelPage> {
         ),
       ),
     );
-  }
-
-  String _planesHint(int? planes) {
-    switch (planes) {
-      case 1: return '(1 = RGBA/NV21, wrong)';
-      case 3: return '(3 = YUV, correct)';
-      case null:
-      case 0:
-        return '(no frame)';
-      default: return '(unexpected)';
-    }
-  }
-
-  String _pixelStrideHint(int? stride) {
-    switch (stride) {
-      case 1: return '(1 = Y-plane, correct)';
-      case 4: return '(4 = RGBA, wrong)';
-      case null:
-      case 0:
-        return '(none)';
-      default: return '(unexpected)';
-    }
   }
 
   Widget _section(String title, Map<String, Object?> values) {
