@@ -34,13 +34,7 @@ wxscan-ffi = { path = "../../../../wxscan-rs/crates/wxscan-ffi", default-feature
 wxscan = { path = "../../../../wxscan-rs/crates/wxscan" }
 # Used by the Android binding to convert GB2312 payloads for display.
 encoding_rs = "0.8"
-fast_image_resize = "5.1" # или актуальную версию
-# One feature per image format, forwarded to wxscan-ffi, plus HEIC which is
-# this crate's own. `default` is what a build gets when the pubspec says
-# nothing, and matches what the package carried before any of this was
-# configurable: everything, except that webp, bmp and tiff and the HEIC
-# decoder are the hook's to leave out on Apple, where ImageIO reads all four
-# already.
+ 
 [features]
 default = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "heic"]
 png = ["wxscan-ffi/png"]
