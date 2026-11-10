@@ -62,13 +62,21 @@ import java.util.concurrent.Executors
  * immediately, and the analyser never leaves that state, dropping hundreds
  * of frames and making markers update in bursts.
  *
- * **Downscale.** Handled entirely in Rust (`jni_shim.rs` via
- * `fast_image_resize`). Kotlin passes the dense buffer as-is. Rust scales
- * proportionally if the frame exceeds its internal 1M px limit, and returns
- * the downscaled dimensions in the JSON, which Dart picks up automatically.
+ * **Downscale.** Handled entirely in Rust (`jni_shim.rs` via a bilinear
+ * resize). Kotlin passes the dense buffer as-is. Rust scales proportionally
+ * if the frame exceeds its internal 1M px limit, and returns the downscaled
+ * dimensions in the JSON, which Dart picks up automatically.
  *
  * **Watchdog.** If `busy` stays true for >5 s, it is reset. Protects against
  * a native hang in Rust.
+ *
+ * **Lifecycle.** The plugin's own LifecycleRegistry follows the Activity:
+ * CREATED while the activity is paused, RESUMED while visible. This is what
+ * makes CameraX release the camera on background and reacquire it on return,
+ * which is the fix for the "frozen preview after coming back from
+ * background" symptom on this Huawei — the camera was never being released,
+ * so the OS took it away without the plugin knowing, and on return there was
+ * no open session to deliver frames from.
  */
 class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     EventChannel.StreamHandler, ActivityAware, LifecycleOwner {
@@ -111,6 +119,15 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     private lateinit var textureRegistry: TextureRegistry
 
     private var activity: Activity? = null
+
+    /**
+     * Whether the activity is currently in the foreground. Set by the
+     * pause/resume listeners in [onAttachedToActivity]; used to decide
+     * whether a frame that arrives after a rebind is expected or is a
+     * leftover from before the pause.
+     */
+    @Volatile private var activityResumed = false
+
     private val main = Handler(Looper.getMainLooper())
 
     private val camExec = Executors.newSingleThreadExecutor()
@@ -244,10 +261,31 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
     }
 
-    override fun onAttachedToActivity(binding: ActivityPluginBinding) { activity = binding.activity }
-    override fun onDetachedFromActivityForConfigChanges() {}
-    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) { activity = binding.activity }
-    override fun onDetachedFromActivity() { activity = null }
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        activity = binding.activity
+        activityResumed = true
+        binding.addOnPauseListener { handleActivityPaused() }
+        binding.addOnResumeListener { handleActivityResumed() }
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        activityResumed = false
+        handleActivityPaused()
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        activity = binding.activity
+        activityResumed = true
+        binding.addOnPauseListener { handleActivityPaused() }
+        binding.addOnResumeListener { handleActivityResumed() }
+        handleActivityResumed()
+    }
+
+    override fun onDetachedFromActivity() {
+        activity = null
+        activityResumed = false
+        handleActivityPaused()
+    }
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) { scanSink = events }
     override fun onCancel(arguments: Any?) { scanSink = null }
@@ -388,6 +426,8 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "minSubmitInterval" to MIN_SUBMIT_INTERVAL_MS,
                             "cameraStateType" to cameraStateType,
                             "cameraIsReady" to cameraIsReady,
+                            "activityResumed" to activityResumed,
+                            "lifecycleState" to lifecycleRegistry.currentState.name,
                             "desiredSize" to
                                 "${targetSize(targetShortSide).width}x" +
                                 "${targetSize(targetShortSide).height}",
@@ -722,6 +762,65 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
     }
 
+    /**
+     * Called when the activity goes to background.
+     *
+     * Moving the plugin's own LifecycleRegistry to CREATED tells CameraX to
+     * release the use cases — and through them, the camera hardware. A
+     * scanner has no reason to hold the camera while the user is looking at
+     * something else, and on Android 9+ the OS takes it away anyway. Without
+     * this the HAL releases the camera behind the plugin's back, no frames
+     * arrive, and on return the preview shows the last frame forever.
+     */
+    private fun handleActivityPaused() {
+        try {
+            android.util.Log.i(
+                TAG,
+                "activity paused (resumed=$activityResumed) — releasing camera"
+            )
+            cancelGateFallback()
+            cancelAutoRebind()
+            cameraIsReady = false
+            firstFrameReceived = false
+            if (lifecycleRegistry.currentState.isAtLeast(Lifecycle.State.CREATED)) {
+                lifecycleRegistry.currentState = Lifecycle.State.CREATED
+            }
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "handleActivityPaused failed", e)
+        }
+    }
+
+    /**
+     * Called when the activity comes back to the foreground.
+     *
+     * Moving the LifecycleRegistry back to RESUMED tells CameraX to
+     * reacquire the camera and reattach the use cases to the same
+     * SurfaceTexture. On a Huawei the HAL sometimes refuses to reacquire on
+     * its own — that is what the gate fallback and auto-rebind are for;
+     * [armGateFallback] and [armAutoRebind] are re-armed here so the
+     * sequence behaves exactly as on the first open.
+     */
+    private fun handleActivityResumed() {
+        try {
+            android.util.Log.i(
+                TAG,
+                "activity resumed — reacquiring camera (bindCount=$bindCount)"
+            )
+            if (lifecycleRegistry.currentState.isAtLeast(Lifecycle.State.CREATED)) {
+                lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+            }
+            cameraIsReady = false
+            firstFrameReceived = false
+            if (cameraStateObserver == null && camera != null) {
+                watchCameraState("resume")
+            }
+            armGateFallback()
+            armAutoRebind()
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "handleActivityResumed failed", e)
+        }
+    }
+
     private fun watchCameraState(label: String) {
         unwatchCameraState()
         val cam = camera ?: return
@@ -786,7 +885,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         cancelAutoRebind()
         val r = Runnable {
             try {
-                if (analyzedFrames > 0L) {
+                if (firstFrameReceived) {
                     android.util.Log.i(TAG, "auto-rebind: frames flowing, no retry needed")
                     return@Runnable
                 }
@@ -1332,6 +1431,7 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             cameraIsReady = false
             cameraStateType = "unknown"
             preOpenFrames = 0
+            activityResumed = false
             starting = false
             orientationListener?.disable()
             orientationListener = null
