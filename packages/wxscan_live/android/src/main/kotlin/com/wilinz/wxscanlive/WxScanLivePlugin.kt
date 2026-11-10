@@ -47,36 +47,33 @@ import java.util.concurrent.Executors
  * Preview → Flutter SurfaceTexture (GPU, no CPU per frame); ImageAnalysis →
  * Y plane → Rust over JNI.
  *
- * This version follows the official CameraX QR-scanner sample as closely as
- * the Y-plane-to-Rust path allows: one bindToLifecycle with default
- * settings, no UseCaseGroup, no ViewPort, no CameraState waits, no
- * warm/cold distinction, no retry chain, no kick loop. The only settings
- * imposed on the use cases are setTargetResolution (deprecated, but the
- * only size control the sample path offers) and setOutputImageFormat.
+ * This version follows the official CameraX QR-scanner sample: one
+ * bindToLifecycle with default settings, no UseCaseGroup, no ViewPort, no
+ * CameraState waits, no warm/cold distinction, no retry chain, no kick loop.
+ * The only settings imposed are setTargetResolution (deprecated, but the
+ * only size control this path offers) and setOutputImageFormat (explicit,
+ * because Huawei HALs do not honour the YUV default reliably).
  *
- * **setOutputImageFormat(YUV_420_888) is explicit, not left to default.**
+ * **Frame diagnostics.**
  *
- * CameraX's default is YUV_420_888, but on Huawei HALs the default is not
- * reliably honoured: with no format stated, the analyser has been observed
- * to receive RGBA_8888 — one plane, four bytes per pixel, R G B A R G B A
- * ... — and this file treats planes[0] as a grayscale Y plane. Fed RGBA as
- * Y, the CNN detector still finds a QR-shaped pattern (it is trained on
- * tolerant input), but the decoder cannot read it (it is strict). That is
- * the "candidates > 0, results = 0" symptom: the frame arrives, something
- * QR-like is detected, and no text comes out. Asking for YUV by name
- * removes the ambiguity.
+ * Every frame updates [lastImageFormat], [lastPlanesCount], [lastPixelStride],
+ * [lastRowStride], [lastFrameW], [lastFrameH], [lastFrameRot]. These are
+ * surfaced in [debugState] and shown on the diagnostic panel. Their purpose
+ * is to answer, on a phone with no computer attached, one question: is the
+ * HAL actually delivering YUV_420_888 (format 35, three planes, pixelStride
+ * 1) as asked, or has it quietly substituted something else — RGBA_8888
+ * (format 1, one plane, pixelStride 4), NV21 (format 17), JPEG (256)?
  *
- * Everything else stays as the sample has it: CameraSelector with
- * requireLensFacing(BACK), one bindToLifecycle, imageProxy.image inspected
- * before anything else.
+ * That question matters because this file reads planes[0] as a grayscale Y
+ * plane. If the HAL hands over RGBA, planes[0] is R G B A R G B A ... and
+ * the "image" the scanner sees is one channel out of every fourth pixel —
+ * the detector still finds a QR-shaped pattern in it (tolerant), and the
+ * decoder cannot read it (strict). Which is the "candidates > 0, results =
+ * 0" symptom.
  *
  * **Buffer caching.** [yBuf], [nv21Buf], [downscaleBuf] are reused.
- *
- * **Downscale** only if the HAL ignores the target and hands back something
- * much bigger than asked.
- *
- * **try-catch(Throwable)** on every entry point. Does not catch a Rust
- * SIGABRT — nothing in Kotlin can.
+ * **Downscale** only if the HAL hands back something much bigger than asked.
+ * **try-catch(Throwable)** on every entry point.
  */
 class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     EventChannel.StreamHandler, ActivityAware, LifecycleOwner {
@@ -186,6 +183,24 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     @Volatile private var diagAvg = 0.0
     @Volatile private var diagFirst16 = ""
     @Volatile private var diagFramesSeen = 0L
+
+    // ---- Diagnostic: what the analyser is actually receiving ----
+    // Refreshed on every frame. `format` is android.graphics.ImageFormat:
+    //   35  YUV_420_888   ← correct; planes[0] is the Y plane
+    //   1   RGBA_8888     ← wrong; four bytes per pixel, R G B A ...
+    //   17  NV21          ← wrong for Y-plane reading
+    //   256 JPEG          ← wrong entirely
+    // `planes` is the count from ImageProxy.planes.size: 3 for YUV, 1 for
+    // RGBA / NV21 / JPEG. `pixelStride` is the stride of planes[0]: 1 for
+    // YUV Y-plane and NV21, 4 for RGBA. `rowStride` is bytes per row of
+    // planes[0], usually >= width when the HAL pads rows.
+    @Volatile private var lastImageFormat = -1
+    @Volatile private var lastPlanesCount = 0
+    @Volatile private var lastPixelStride = 0
+    @Volatile private var lastRowStride = 0
+    @Volatile private var lastFrameW = 0
+    @Volatile private var lastFrameH = 0
+    @Volatile private var lastFrameRot = 0
 
     // ---------- FlutterPlugin ----------
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -329,9 +344,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         )
                     )
                 }
-                // Manual rebind, same operation the sample's openCamera()
-                // performs on every open. Useful when a session has gone
-                // silent.
                 "kickStream" -> {
                     main.post {
                         try {
@@ -386,6 +398,15 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                             "diagAvg" to diagAvg,
                             "diagFirst16" to diagFirst16,
                             "diagFramesSeen" to diagFramesSeen,
+                            // ---- image format (what the analyser is
+                            // actually receiving) ----
+                            "lastImageFormat" to lastImageFormat,
+                            "lastPlanesCount" to lastPlanesCount,
+                            "lastPixelStride" to lastPixelStride,
+                            "lastRowStride" to lastRowStride,
+                            "lastFrameW" to lastFrameW,
+                            "lastFrameH" to lastFrameH,
+                            "lastFrameRot" to lastFrameRot,
                         )
                     )
                 }
@@ -605,13 +626,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
     }
 
-    /**
-     * Binds Preview and ImageAnalysis in a single bindToLifecycle, the way
-     * the official CameraX QR-scanner sample does. The only additions are
-     * setTargetResolution (deprecated, but the only size control the sample
-     * path offers) and setOutputImageFormat, stated explicitly so the HAL
-     * does not quietly hand the analyser RGBA instead of YUV.
-     */
     private fun bindUseCases(st: SurfaceTexture) {
         val provider = cameraProvider ?: return
         provider.unbindAll()
@@ -653,14 +667,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         val analysisUseCase = ImageAnalysis.Builder()
             .setTargetResolution(desiredSize)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            // Explicit. CameraX's default is YUV_420_888, but on Huawei HALs
-            // the default is not reliably honoured: without a stated format
-            // the analyser has been observed to receive RGBA_8888 — one
-            // plane, four bytes per pixel — and this file treats planes[0]
-            // as a grayscale Y plane. Fed RGBA as Y, the detector still
-            // finds a QR-shaped pattern (tolerant), but the decoder cannot
-            // read it (strict), which is the "candidates > 0, results = 0"
-            // symptom. Asking for YUV by name removes the ambiguity.
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
         analysisUseCase.setAnalyzer(camExec, ::analyze)
@@ -994,8 +1000,6 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private fun analyze(image: ImageProxy) {
         try {
-            // Same guard as the official sample: image is the ImageProxy's
-            // Image, and it is null when the format cannot carry pixels.
             val mediaImage = image.image
             if (mediaImage == null) {
                 emptyFrames++
@@ -1043,6 +1047,30 @@ class WxScanLivePlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     "first frame arrived (${image.width}x${image.height} " +
                     "rot=${image.imageInfo.rotationDegrees}) — " +
                     "target=$targetShortSide current=$shortSide",
+                )
+            }
+
+            // ---- Refresh the format diagnostic ----
+            lastImageFormat = image.format
+            lastPlanesCount = image.planes.size
+            val p0 = image.planes.getOrNull(0)
+            lastPixelStride = p0?.pixelStride ?: 0
+            lastRowStride = p0?.rowStride ?: 0
+            lastFrameW = image.width
+            lastFrameH = image.height
+            lastFrameRot = image.imageInfo.rotationDegrees
+
+            // Log once per second-ish so a phone-only user still sees the
+            // format in logcat if they attach later.
+            if (diagFramesSeen < 3 || diagFramesSeen % 120 == 0L) {
+                android.util.Log.i(
+                    TAG,
+                    "frame format: ${image.format} " +
+                    "planes=${image.planes.size} " +
+                    "size=${image.width}x${image.height} " +
+                    "plane0: rowStride=${p0?.rowStride} " +
+                    "pixelStride=${p0?.pixelStride} " +
+                    "bytes=${p0?.buffer?.remaining()}",
                 )
             }
 
